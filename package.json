@@ -1,0 +1,10 @@
+{
+  "name": "shinobi-ar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser AR lens: dōjutsu eye effects and hand-seal jutsu, powered by MediaPipe.",
+  "scripts": {
+    "start": "node server.js 8080"
+  },
+  "license": "MIT"
+}

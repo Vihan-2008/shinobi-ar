@@ -1,0 +1,8 @@
+node_modules/
+.vercel/
+.playwright-mcp/
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db

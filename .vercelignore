@@ -1,0 +1,6 @@
+# Local-only tooling: the website is just index.html, css/ and js/.
+server.js
+start.bat
+package.json
+README.md
+.gitignore

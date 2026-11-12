@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval' 'sha256-x3FTNDSsGgrh07P7RIbYCAkNaaObUAHoXk6/5x90Pl8='; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Pins the exact MediaPipe build (same bytes as the official npm package); the browser refuses a tampered copy. -->
+  <script type="importmap">{"integrity":{"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs":"sha384-pv/a53slpd9r+c7gv5R/Yx+690OjBKfh44t0YEEQi74uhGupAjv0NpiHrzlmhiVn"}}</script>
+  <title>Shinobi AR</title>
+  <meta name="description" content="Augmented-reality dōjutsu and hand-seal jutsu lens that runs entirely in your browser.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23c4001a'/%3E%3Ccircle cx='32' cy='32' r='30' fill='none' stroke='%23000' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='7' fill='%23000'/%3E%3Ccircle cx='32' cy='14' r='5' fill='%23000'/%3E%3Ccircle cx='47.6' cy='41' r='5' fill='%23000'/%3E%3Ccircle cx='16.4' cy='41' r='5' fill='%23000'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=Yuji+Syuku&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app" class="app">
+  <canvas id="stage"></canvas>
+  <video id="video" playsinline muted autoplay></video>
+
+  <!-- Legibility scrims over the camera feed (no boxes) -->
+  <div class="scrim scrim-top" aria-hidden="true"></div>
+  <div class="scrim scrim-left" aria-hidden="true"></div>
+  <div class="scrim scrim-right" aria-hidden="true"></div>
+  <div class="scrim scrim-bottom" aria-hidden="true"></div>
+
+  <!-- ───────── Top bar ───────── -->
+  <header class="topbar">
+    <div class="wordmark"><span class="kj">忍</span>Shinobi&nbsp;AR</div>
+    <p class="status" id="status" role="status"><i class="dot"></i><span id="statusText">Preview · camera off</span></p>
+    <nav class="top-actions">
+      <button class="text-btn only-mobile" data-show="eyes">Eyes</button>
+      <button class="text-btn only-mobile" data-show="jutsu">Jutsu</button>
+      <button class="text-btn" id="btnGuide" title="Seal guide, trainer and controls (G)">Guide</button>
+      <button class="text-btn" id="btnSettings" title="Settings">Settings</button>
+      <span class="sep" aria-hidden="true"></span>
+      <button class="icon-btn" id="btnShot" title="Save a photo (P)" aria-label="Save a photo">
+        <svg viewBox="0 0 24 24"><path d="M3 8h4l2-3h6l2 3h4v11H3z"/><circle cx="12" cy="13" r="3.5"/></svg>
+      </button>
+      <button class="icon-btn rec-btn" id="btnRec" title="Record video (R)" aria-label="Record video">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle class="dot" cx="12" cy="12" r="4"/></svg>
+        <span class="rec-time" id="recTime"></span>
+      </button>
+      <button class="icon-btn" id="btnFull" title="Fullscreen (F)" aria-label="Fullscreen">
+        <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
+    </nav>
+  </header>
+
+  <!-- ───────── Left rail: eyes ───────── -->
+  <nav class="rail rail-left" id="railEyes" aria-label="Eyes">
+    <h2 class="rail-title"><span class="kj">眼</span>Eyes</h2>
+    <ol class="preset-list" id="presetList"></ol>
+    <button class="text-btn rail-link" id="btnMix">Mix each eye &amp; tune →</button>
+
+    <h2 class="rail-title"><span class="kj">瞳</span>Eye abilities</h2>
+    <ul class="ability-list" id="abilityList"></ul>
+    <p class="rail-note" id="abilityNote"></p>
+
+    <div class="rail-foot only-mobile">
+      <button class="text-btn" data-open="guideModal">Guide</button>
+      <button class="text-btn" data-open="settingsModal">Settings</button>
+    </div>
+  </nav>
+
+  <!-- ───────── Right rail: jutsu ───────── -->
+  <aside class="rail rail-right" id="railJutsu" aria-label="Jutsu">
+    <h2 class="rail-title"><span class="kj">術</span>Jutsu</h2>
+    <ol class="jutsu-list" id="jutsuList"></ol>
+    <button class="text-btn rail-link" id="btnSealGuide">How to make each seal →</button>
+  </aside>
+
+  <!-- ───────── Seal readout ───────── -->
+  <section class="seal-hud" id="sealHud" aria-live="polite">
+    <div class="seal-mark">
+      <svg class="ring" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="50" cy="50" r="46" class="track"/>
+        <circle cx="50" cy="50" r="46" class="fill" id="sealRing"/>
+      </svg>
+      <span class="kj" id="sealKanji">印</span>
+    </div>
+    <div class="seal-text">
+      <div class="seal-name" id="sealName">Raise both hands to form a seal</div>
+      <div class="seal-hands" id="handsDebug"></div>
+      <div class="seal-seq" id="sealSeq"></div>
+      <div class="chakra" title="Chakra recovers over time"><span>Chakra</span><i><b id="chakraFill"></b></i></div>
+    </div>
+  </section>
+
+  <div class="toasts" id="toasts"></div>
+
+  <!-- ───────── Mix sheet ───────── -->
+  <section class="sheet hidden" id="mixSheet" role="dialog" aria-labelledby="mixTitle">
+    <header class="sheet-head">
+      <h2 id="mixTitle">Mix each eye</h2>
+      <button class="text-btn" data-close-sheet>Done</button>
+    </header>
+    <p class="hint">Click a name to put it in both eyes, or pick a column to set one eye or a third eye on the forehead.</p>
+    <table class="mix-table">
+      <thead><tr><th colspan="2">Dōjutsu</th><th>Left</th><th>Right</th><th>Third</th></tr></thead>
+      <tbody id="mixBody"></tbody>
+    </table>
+    <h3 class="group-title">Tuning</h3>
+    <div class="rows">
+      <label class="row"><span class="row-label">Size</span><input type="range" id="eyeSize" min="0.7" max="1.5" step="0.01"><output></output></label>
+      <label class="row"><span class="row-label">Glow</span><input type="range" id="eyeGlow" min="0" max="1.5" step="0.01"><output></output></label>
+      <label class="row"><span class="row-label">Spin</span><input type="range" id="eyeSpin" min="0" max="3" step="0.01"><output></output></label>
+      <label class="row"><span class="row-label">Opacity</span><input type="range" id="eyeOpacity" min="0.3" max="1" step="0.01"><output></output></label>
+    </div>
+  </section>
+
+  <!-- ───────── Start ───────── -->
+  <div class="overlay" id="startScreen">
+    <div class="start">
+      <canvas id="emblem" width="192" height="192" aria-hidden="true"></canvas>
+      <h1>Shinobi AR</h1>
+      <p class="start-lead">Puts the Sharingan, Mangekyō, Rinnegan and Byakugan on your own eyes and reads your hand seals to cast jutsu. It needs your webcam. Video stays on this device.</p>
+      <table class="load-table" id="loadList">
+        <tr data-k="camera"><th>Camera</th><td>Waiting</td></tr>
+        <tr data-k="face"><th>Face &amp; iris tracking</th><td>Waiting</td></tr>
+        <tr data-k="hand"><th>Hand tracking</th><td>Waiting</td></tr>
+        <tr data-k="seg"><th>Body outline (clones, Susanoo)</th><td>Waiting</td></tr>
+      </table>
+      <p class="error hidden" id="startError" role="alert"></p>
+      <div class="start-actions">
+        <button class="btn" id="btnStart">Enable camera</button>
+        <button class="text-btn" id="btnNoCam">Preview without camera</button>
+      </div>
+      <p class="fine">Best in Chrome or Edge. Fan project, not affiliated with any rights holder.</p>
+    </div>
+  </div>
+
+  <!-- ───────── Guide / trainer ───────── -->
+  <div class="modal hidden" id="guideModal" role="dialog" aria-modal="true" aria-labelledby="guideTitle">
+    <div class="modal-card wide">
+      <header class="modal-head">
+        <h2 id="guideTitle">Guide</h2>
+        <div class="tabs" id="guideTabs" role="tablist">
+          <button data-tab="seals" class="on" role="tab">Hand seals</button>
+          <button data-tab="trainer" role="tab">Teach your own seals</button>
+          <button data-tab="controls" role="tab">Controls</button>
+        </div>
+        <button class="text-btn close" data-close>Close</button>
+      </header>
+      <div class="modal-body">
+        <div class="tab" data-tab="seals">
+          <p class="hint">These are simplified so the hand tracker can tell them apart. Keep both hands in view, close together, palms to the camera, and hold until the ring fills. Prefer the real interlocked seals? Record them under <b>Teach your own seals</b>.</p>
+          <table class="seal-table" id="sealGuide">
+            <thead><tr><th>Key</th><th colspan="2">Seal</th><th>Easy gesture</th><th>How</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="tab hidden" data-tab="trainer">
+          <div class="trainer">
+            <div>
+              <p class="hint">Pick a seal, press <b>Record</b>, then hold the pose for 3 seconds while moving it slightly. Also record <b>Idle</b> (relaxed hands) to cut false triggers. Samples are kept in this browser.</p>
+              <table class="trainer-table" id="trainerGrid"><tbody></tbody></table>
+            </div>
+            <div class="trainer-side">
+              <div class="live-line"><span>Seeing now</span><b id="trainerLive">—</b></div>
+              <div class="live-sub" id="trainerLiveSub"></div>
+              <button class="btn" id="btnRecordSeal">Record selected seal</button>
+              <p class="trainer-status" id="trainerStatus">Select a seal on the left.</p>
+              <div class="rows">
+                <label class="row"><span class="row-label">Match tolerance</span><input type="range" id="knnSens" min="0.5" max="2" step="0.05"><output></output></label>
+              </div>
+              <div class="link-row">
+                <button class="text-btn" id="btnClearSeal">Clear selected</button>
+                <button class="text-btn" id="btnClearAll">Clear all</button>
+                <button class="text-btn" id="btnExport">Export</button>
+                <label class="text-btn file">Import<input type="file" id="fileImport" accept="application/json"></label>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="tab hidden" data-tab="controls">
+          <div class="controls">
+            <section>
+              <h3 class="group-title">Gestures</h3>
+              <dl class="kv">
+                <dt>Hand seals</dt><dd>Form seals in order to cast a jutsu</dd>
+                <dt>Rasengan</dt><dd>Hold one open palm to the camera for about a second</dd>
+                <dt>Rasenshuriken</dt><dd>Lift the Rasengan above your head</dd>
+                <dt>Amaterasu</dt><dd>Mangekyō, then wink one eye and look at a spot</dd>
+                <dt>Kamui</dt><dd>Mangekyō, then point one index finger and hold</dd>
+                <dt>Shinra Tensei</dt><dd>Rinnegan, then push an open palm toward the camera</dd>
+              </dl>
+            </section>
+            <section>
+              <h3 class="group-title">Keyboard</h3>
+              <dl class="kv">
+                <dt>1–0, −, =</dt><dd>Rat to Boar seals</dd>
+                <dt>C</dt><dd>Clone (cross) seal</dd>
+                <dt>E, Shift+E</dt><dd>Next or previous eye preset</dd>
+                <dt>T A K U N B I</dt><dd>Tsukuyomi, Amaterasu, Kamui, Susanoo, Shinra Tensei, Byakugan sight, Infinite Tsukuyomi</dd>
+                <dt>Space</dt><dd>Rasengan</dd>
+                <dt>X</dt><dd>Release (“Kai”): stop everything</dd>
+                <dt>H</dt><dd>Hide the interface</dd>
+                <dt>G, P, R, F</dt><dd>Guide, photo, record, fullscreen</dd>
+              </dl>
+            </section>
+            <section>
+              <h3 class="group-title">Voice</h3>
+              <p class="hint">Turn on in Settings, then call out a jutsu: “Fireball”, “Chidori”, “Rasengan”, “Shadow clone”, “Amaterasu”, “Sharingan”, “Rinnegan”, “Byakugan”, “Kai”. Recognition is done by your browser and may use an online service.</p>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ───────── Settings ───────── -->
+  <div class="modal hidden" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2 id="settingsTitle">Settings</h2>
+        <button class="text-btn close" data-close>Close</button>
+      </header>
+      <div class="modal-body">
+        <h3 class="group-title">View</h3>
+        <div class="rows">
+          <label class="row"><span class="row-label">Camera</span><select id="setCamera"><option value="">Default camera</option></select></label>
+          <label class="row"><span class="row-label">Framing</span><select id="setFit"><option value="cover">Fill the screen</option><option value="contain">Show the whole frame</option></select></label>
+          <label class="row"><span class="row-label">Mirror view</span><input type="checkbox" class="switch" id="setMirror"></label>
+          <label class="row"><span class="row-label">Show hand shapes under the seal</span><input type="checkbox" class="switch" id="setHandDebug"></label>
+          <label class="row"><span class="row-label">Show tracking points</span><input type="checkbox" class="switch" id="setLandmarks"></label>
+        </div>
+        <h3 class="group-title">Seals</h3>
+        <div class="rows">
+          <label class="row"><span class="row-label">Recognition</span><select id="setSealMode"><option value="auto">Your recordings, then easy seals</option><option value="rules">Easy seals only</option><option value="trained">Your recordings only</option></select></label>
+          <label class="row"><span class="row-label">Hold time</span><input type="range" id="setHold" min="80" max="600" step="10"><output></output></label>
+          <label class="row"><span class="row-label">Forgive up to 2 stray seals</span><input type="checkbox" class="switch" id="setLenient"></label>
+          <label class="row"><span class="row-label">Gesture triggers <small>Rasengan, Amaterasu, Kamui, Shinra Tensei</small></span><input type="checkbox" class="switch" id="setGestures"></label>
+        </div>
+        <h3 class="group-title">Sound &amp; effects</h3>
+        <div class="rows">
+          <label class="row"><span class="row-label">Volume</span><input type="range" id="setVolume" min="0" max="1" step="0.01"><output></output></label>
+          <label class="row"><span class="row-label">Effect detail</span><select id="setQuality"><option value="low">Low (faster)</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+          <label class="row"><span class="row-label">Voice commands</span><input type="checkbox" class="switch" id="setVoice"></label>
+          <label class="row"><span class="row-label">Unlimited chakra</span><input type="checkbox" class="switch" id="setChakra"></label>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
