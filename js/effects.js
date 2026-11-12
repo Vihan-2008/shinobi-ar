@@ -1,7 +1,7 @@
 // Jutsu & dōjutsu-ability visual effects, plus the FX manager that layers them.
 
 import {
-  glowSprite, puffSprite, blackFlameSprite, rockSprite, ParticleSystem,
+  glowSprite, puffSprite, blackFlameSprite, rockSprite, flameSprite, ParticleSystem,
   rand, clamp, lerp, easeOut, easeIn, easeInOut, mulberry32,
 } from './particles.js';
 import { patternCanvas } from './dojutsu.js';
@@ -62,7 +62,12 @@ export class FX {
   }
 
   update(dt) {
-    for (const e of this.effects) if (!e.done) e.update(dt);
+    for (const e of this.effects) {
+      if (e.done) continue;
+      // A clone's copy of a jutsu ends as soon as its clone is gone.
+      if (e.xf && !e.xf()) { e.finish(); continue; }
+      e.update(dt);
+    }
     this.effects = this.effects.filter(e => !e.done);
     this.ps.update(dt);
     this.shakeAmt = Math.max(0, this.shakeAmt - dt * 40);
@@ -73,6 +78,28 @@ export class FX {
   }
 
   needsSeg() { return this.effects.some(e => e.needsSeg); }
+  needsSnapshot() { return this.effects.some(e => e.needsSnapshot); }
+
+  /** Map face geometry into a clone's frame: q = (ox + x·s, oy + y·s). */
+  xfFace(f, x) {
+    if (!f || !x) return f;
+    const P = p => ({ x: x.ox + p.x * x.s, y: x.oy + p.y * x.s });
+    const eye = e => ({
+      ...e, iris: P(e.iris), irisR: e.irisR * x.s, lowerLid: P(e.lowerLid), upperLid: P(e.upperLid),
+      center: P(e.center), inner: P(e.inner), outer: P(e.outer), width: e.width * x.s, poly: e.poly.map(P),
+    });
+    return {
+      ...f, pts: null, mouth: P(f.mouth), nose: P(f.nose), chin: P(f.chin), top: P(f.top), center: P(f.center),
+      gaze: P(f.gaze), thirdEye: P(f.thirdEye), faceW: f.faceW * x.s, faceH: f.faceH * x.s, eyeSpan: f.eyeSpan * x.s,
+      left: eye(f.left), right: eye(f.right),
+    };
+  }
+
+  xfHands(hs, x) {
+    if (!x) return hs;
+    const P = p => ({ x: x.ox + p.x * x.s, y: x.oy + p.y * x.s, z: p.z });
+    return hs.map(h => ({ ...h, pts: h.pts.map(P), palm: P(h.palm), tip: P(h.tip), size: h.size * x.s }));
+  }
   wantsHistory() { return this.effects.some(e => e.wantsHistory); }
   hasBack() { return this.effects.some(e => e.hasBack); }
 
@@ -109,24 +136,32 @@ export class FX {
 
   callout(data) {
     this.callouts = [];
-    this.callouts.push({ ...data, t: 0, dur: data.dur || 2.6, brush: makeBrush(data.seed || Math.random() * 1e5) });
+    const c = { ...data, t: 0, dur: data.dur || 2.6, brush: makeBrush(data.seed || Math.random() * 1e5) };
+    c.text = makeCalloutText(c); // rendered once; drawing a pre-made image each frame is far cheaper than blurred text
+    this.callouts.push(c);
   }
 
   ring(x, y, r, p, color) { this.hud.push({ x, y, r, p, color }); }
 
-  /** Additive coloured silhouette glow from the segmentation mask. */
+  /**
+   * Additive coloured silhouette glow from the segmentation mask. The softness comes from drawing the
+   * mask into a tiny canvas and stretching it back up, which costs almost nothing, unlike a canvas
+   * blur filter (that can fall back to the CPU on some laptops and stall the whole page).
+   */
   drawAura(ctx, color, scale, blur, alpha, cx) {
     const m = this.mask;
     if (!m || !m.ready) return false;
     const { W, H } = this;
-    const aw = Math.round(W / 4), ah = Math.round(H / 4);
-    const a = this.auraCanvas;
+    const div = Math.max(4, Math.min(22, Math.round(blur / 1.5)));
+    const aw = Math.max(8, Math.round(W / div)), ah = Math.max(8, Math.round(H / div));
+    this.auraCanvases ||= {};
+    const a = this.auraCanvases[div] || (this.auraCanvases[div] = document.createElement('canvas'));
     if (a.width !== aw || a.height !== ah) { a.width = aw; a.height = ah; }
     const x = a.getContext('2d');
     x.globalCompositeOperation = 'source-over';
     x.clearRect(0, 0, aw, ah);
     x.save();
-    x.filter = `blur(${Math.max(1, blur / 4)}px)`;
+    x.imageSmoothingQuality = 'high';
     if (m.mirror) { x.translate(aw, 0); x.scale(-1, 1); }
     x.drawImage(m.canvas, 0, 0, aw, ah);
     x.restore();
@@ -138,6 +173,8 @@ export class FX {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = clamp(alpha);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(a, ax - ax * scale, H - H * scale, W * scale, H * scale);
     ctx.restore();
     return true;
@@ -169,18 +206,25 @@ export class FX {
 }
 
 function drawChargeRing(ctx, { x, y, r, p, color }) {
+  const w = Math.max(3, r * 0.08);
+  const end = -Math.PI / 2 + TAU * clamp(p);
   ctx.save();
   ctx.lineCap = 'round';
-  ctx.lineWidth = Math.max(3, r * 0.08);
+  ctx.lineWidth = w;
   ctx.strokeStyle = 'rgba(255,255,255,0.18)';
   ctx.beginPath();
   ctx.arc(x, y, r, 0, TAU);
   ctx.stroke();
   ctx.strokeStyle = color;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 14;
+  ctx.globalAlpha = 0.3; // soft halo without shadowBlur
+  ctx.lineWidth = w * 3;
   ctx.beginPath();
-  ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(p));
+  ctx.arc(x, y, r, -Math.PI / 2, end);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = w;
+  ctx.beginPath();
+  ctx.arc(x, y, r, -Math.PI / 2, end);
   ctx.stroke();
   ctx.restore();
 }
@@ -227,13 +271,47 @@ function makeBrush(seed) {
   return c;
 }
 
+// The banner text is laid out on a fixed 1000-wide canvas (brush height 240) and scaled at draw time.
+const CT_W = 1000, CT_BH = 240, CT_H = 330, CT_CY = 115;
+
+function makeCalloutText(c) {
+  const cv = document.createElement('canvas');
+  cv.width = CT_W; cv.height = CT_H;
+  const x = cv.getContext('2d');
+  x.translate(CT_W / 2, CT_CY);
+  let kSize = Math.round(CT_BH * 0.4);
+  x.font = `${kSize}px "Yuji Syuku", "Yu Mincho", serif`;
+  const tw = x.measureText(c.kanji).width;
+  if (tw > CT_W * 0.8) { kSize = Math.floor((kSize * CT_W * 0.8) / tw); x.font = `${kSize}px "Yuji Syuku", "Yu Mincho", serif`; }
+  x.textAlign = 'center';
+  x.textBaseline = 'middle';
+  x.lineJoin = 'round';
+  x.lineWidth = kSize * 0.12;
+  x.strokeStyle = 'rgba(0,0,0,0.9)';
+  x.strokeText(c.kanji, 0, 0);
+  x.shadowColor = c.color || '#e0312b';
+  x.shadowBlur = kSize * 0.35;
+  x.fillStyle = '#fff';
+  x.fillText(c.kanji, 0, 0);
+  x.shadowBlur = 0;
+  x.font = `700 ${Math.round(CT_BH * 0.15)}px "Barlow Condensed", sans-serif`;
+  if ('letterSpacing' in x) x.letterSpacing = `${Math.round(CT_BH * 0.02)}px`;
+  x.fillStyle = '#f3ead8';
+  x.fillText(c.title.toUpperCase(), 0, CT_BH * 0.43);
+  if (c.sub) {
+    x.font = `500 ${Math.round(CT_BH * 0.1)}px "Barlow Condensed", sans-serif`;
+    x.fillStyle = 'rgba(243,234,216,0.75)';
+    x.fillText(c.sub, 0, CT_BH * 0.6);
+  }
+  return cv;
+}
+
 function drawCallout(ctx, c, W, H) {
   const kIn = easeOut(c.t / 0.28);
   const kOut = c.t > c.dur - 0.45 ? clamp((c.dur - c.t) / 0.45) : 1;
   const cy = H * 0.19;
   const bw = Math.min(W * 0.64, H * 1.15), bh = bw * 0.24;
   ctx.save();
-  ctx.globalAlpha = kOut;
   // brush stroke wipes in from the left
   ctx.save();
   ctx.beginPath();
@@ -246,56 +324,65 @@ function drawCallout(ctx, c, W, H) {
   ctx.fillStyle = c.color || '#e0312b';
   ctx.globalAlpha = 0.9 * kOut;
   ctx.fillRect(W / 2 - bw * 0.36, cy + bh * 0.3, bw * 0.72 * kIn, Math.max(2, bh * 0.025));
-  // kanji
-  const s = 1 + (1 - kIn) * 0.35;
+  // pre-rendered kanji + title, settling from a slight zoom
+  const s = (1 + (1 - kIn) * 0.35) * (bw / CT_W);
   ctx.globalAlpha = kOut * kIn;
   ctx.translate(W / 2, cy - bh * 0.02);
   ctx.scale(s, s);
-  let kSize = Math.round(bh * 0.4);
-  ctx.font = `${kSize}px "Yuji Syuku", "Yu Mincho", serif`;
-  const tw = ctx.measureText(c.kanji).width;
-  if (tw > bw * 0.8) { kSize = Math.floor(kSize * (bw * 0.8) / tw); ctx.font = `${kSize}px "Yuji Syuku", "Yu Mincho", serif`; }
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.lineJoin = 'round';
-  ctx.lineWidth = kSize * 0.12;
-  ctx.strokeStyle = 'rgba(0,0,0,0.9)';
-  ctx.strokeText(c.kanji, 0, 0);
-  ctx.shadowColor = c.color || '#e0312b';
-  ctx.shadowBlur = kSize * 0.35;
-  ctx.fillStyle = '#fff';
-  ctx.fillText(c.kanji, 0, 0);
-  ctx.shadowBlur = 0;
-  ctx.font = `700 ${Math.round(bh * 0.15)}px "Barlow Condensed", sans-serif`;
-  if ('letterSpacing' in ctx) ctx.letterSpacing = `${Math.round(bh * 0.02)}px`;
-  ctx.fillStyle = '#f3ead8';
-  ctx.fillText(c.title.toUpperCase(), 0, bh * 0.43);
-  if (c.sub) {
-    ctx.font = `500 ${Math.round(bh * 0.1)}px "Barlow Condensed", sans-serif`;
-    ctx.fillStyle = 'rgba(243,234,216,0.75)';
-    ctx.fillText(c.sub, 0, bh * 0.6);
-  }
+  ctx.drawImage(c.text, -CT_W / 2, -CT_CY);
   ctx.restore();
 }
 
 /* ═════════════════════════ Effect base ═════════════════════════ */
 
+// Stand-in for the sound engine on clone copies, so five fireballs don't play five roars.
+const MUTE = new Proxy({}, {
+  get: (_, key) => (key === 'rasenganLoop' ? () => ({ stop() {}, shuriken() {} })
+    : key === 'chidoriLoop' || key === 'auraLoop' ? () => () => {} : () => {}),
+});
+
 class Effect {
-  constructor(fx) {
+  /**
+   * opts.xf     — for a shadow clone's copy: a function returning the clone transform {s, ox, oy}
+   *               (or null once the clone is gone). Face and hand geometry are mapped through it.
+   * opts.silent — no sound, flash, shake or banner (the original cast already provides them).
+   * opts.rateK  — particle emission multiplier, so many copies stay affordable.
+   */
+  constructor(fx, opts = {}) {
     this.fx = fx;
     this.t = 0;
     this.done = false;
     this.needsSeg = false;
+    this.needsSnapshot = false;
     this.wantsHistory = false;
     this.hasBack = false;
     this.mode = null;
+    this.xf = opts.xf || null;
+    this.silent = !!opts.silent;
+    this.rateK = opts.rateK ?? 1;
   }
   get W() { return this.fx.world.W; }
   get H() { return this.fx.world.H; }
-  get face() { return this.fx.world.face; }
-  get hands() { return this.fx.world.hands; }
+  get face() { const f = this.fx.world.face; return this.xf ? this.fx.xfFace(f, this.xf()) : f; }
+  get hands() { const hs = this.fx.world.hands; return this.xf ? this.fx.xfHands(hs, this.xf()) : hs; }
   get ps() { return this.fx.ps; }
   get S() { return this.fx.spr; }
+  get snd() { return this.silent ? MUTE : this.fx.sfx; }
+  shake(a) { if (!this.silent) this.fx.shake(a); }
+  flash(...args) { if (!this.silent) this.fx.flash(...args); }
+  /** Map a world point into this effect's clone frame (identity for the original). */
+  xfPoint(p) {
+    const x = this.xf && this.xf();
+    return x ? { x: x.ox + p.x * x.s, y: x.oy + p.y * x.s } : { ...p };
+  }
+  nearestHand(p, maxD = Infinity) {
+    let best = null, bd = maxD;
+    for (const h of this.hands) {
+      const d = Math.hypot(h.palm.x - p.x, h.palm.y - p.y);
+      if (d < bd) { bd = d; best = h; }
+    }
+    return best;
+  }
   update(dt) { this.t += dt; }
   drawBack() {}
   draw() {}
@@ -311,11 +398,11 @@ class Effect {
 /* ═════════════════════════ Fire ═════════════════════════ */
 
 export class Fireball extends Effect {
-  constructor(fx) {
-    super(fx);
+  constructor(fx, opts) {
+    super(fx, opts);
     this.dur = 3.5;
     this.o = this.mouth();
-    fx.sfx.fire(2.9);
+    this.snd.fire(2.9);
   }
   mouth() {
     const f = this.face;
@@ -328,14 +415,14 @@ export class Fireball extends Effect {
     const o = this.o;
     o.x = lerp(o.x, m.x, 0.35); o.y = lerp(o.y, m.y, 0.35); o.s = lerp(o.s, m.s, 0.2);
     if (t < 0.55) {
-      for (let i = ps.count(110, dt); i > 0; i--) {
+      for (let i = ps.count(110 * this.rateK, dt); i > 0; i--) {
         ps.emit({ x: o.x + rand(-1, 1) * o.s * 0.07, y: o.y, vx: rand(-40, 40), vy: rand(-150, -40), life: rand(0.25, 0.5), size: o.s * 0.16, size1: o.s * 0.03, sprites: S.fire });
       }
     } else if (t < 2.75) {
       const k = (t - 0.55) / 2.2;
       const R = o.s * (0.35 + 4.4 * Math.pow(k, 1.45));
       const b = this.ball = { x: lerp(o.x, this.W / 2, k * 0.4), y: lerp(o.y, this.H * 0.5, k * 0.4) - k * o.s * 0.25, R };
-      const rate = 460 * Math.min(1, 200 / R) + 45;
+      const rate = (460 * Math.min(1, 200 / R) + 45) * this.rateK;
       for (let i = ps.count(rate, dt); i > 0; i--) {
         const a = rand(0, TAU), r = R * Math.sqrt(Math.random()) * 0.8;
         ps.emit({
@@ -344,19 +431,19 @@ export class Fireball extends Effect {
           drag: 1.6, life: rand(0.35, 0.7), size: R * rand(0.3, 0.5), size1: R * rand(0.55, 0.85), sprites: S.fire, rot: rand(0, TAU), alpha: 0.42,
         });
       }
-      for (let i = ps.count(160, dt); i > 0; i--) {
+      for (let i = ps.count(160 * this.rateK, dt); i > 0; i--) {
         const u = Math.random();
         ps.emit({ x: lerp(o.x, b.x, u) + rand(-8, 8), y: lerp(o.y, b.y, u), vx: rand(-30, 30), vy: rand(-80, 0), life: 0.25, size: lerp(o.s * 0.2, R * 0.6, u), size1: lerp(o.s * 0.1, R * 0.4, u), sprites: S.fire, alpha: 0.5 });
       }
-      if (R > o.s * 0.8) {
+      if (R > o.s * 0.8 && !this.silent) {
         for (let i = ps.count(10, dt); i > 0; i--) {
           ps.emit({ x: b.x + rand(-1, 1) * R * 0.6, y: b.y - R * 0.7, vx: rand(-50, 50), vy: -R * 0.6, life: 1.4, size: R * 0.8, size1: R * 1.5, sprite: S.fireSmoke, blend: 'source-over', alpha: 0.22 });
         }
       }
-      this.fx.shake(4 + k * 14);
+      this.shake(4 + k * 14);
     } else {
-      if (!this.flashed) { this.flashed = true; this.fx.flash('#ff7a1a', 0.6, 1.3); this.ball = null; }
-      for (let i = ps.count(70, dt); i > 0; i--) {
+      if (!this.flashed) { this.flashed = true; this.flash('#ff7a1a', 0.6, 1.3); this.ball = null; }
+      for (let i = ps.count(this.silent ? 0 : 70, dt); i > 0; i--) {
         ps.emit({ x: rand(0, this.W), y: rand(0, this.H), vx: rand(-40, 40), vy: rand(-140, -30), life: rand(0.8, 1.6), size: rand(4, 10), sprite: S.ember });
       }
     }
@@ -381,8 +468,8 @@ export class Fireball extends Effect {
 }
 
 export class PhoenixFlower extends Effect {
-  constructor(fx) {
-    super(fx);
+  constructor(fx, opts) {
+    super(fx, opts);
     const f = this.face;
     this.o = f ? { x: f.mouth.x, y: f.mouth.y, s: f.faceW } : { x: this.W / 2, y: this.H * 0.55, s: this.W * 0.18 };
     this.balls = [];
@@ -393,24 +480,24 @@ export class PhoenixFlower extends Effect {
       this.balls.push({ x: this.o.x, y: this.o.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, delay: i * 0.07 + rand(0, 0.05), r: this.o.s * 0.06, wob: rand(0, TAU), launched: false });
     }
     this.dur = 2.9;
-    fx.sfx.fire(1.8);
+    this.snd.fire(1.8);
   }
   update(dt) {
     super.update(dt);
     const S = this.S, ps = this.ps;
     for (const b of this.balls) {
       if (this.t < b.delay) continue;
-      if (!b.launched) { b.launched = true; this.fx.sfx.whoosh(0.4, true); }
+      if (!b.launched) { b.launched = true; this.snd.whoosh(0.4, true); }
       const age = this.t - b.delay;
       b.vy += 60 * dt;
       b.x += (b.vx + Math.sin(age * 6 + b.wob) * 40) * dt;
       b.y += b.vy * dt;
       b.r = this.o.s * (0.06 + age * 0.13);
-      for (let i = ps.count(160, dt); i > 0; i--) {
+      for (let i = ps.count(160 * this.rateK, dt); i > 0; i--) {
         ps.emit({ x: b.x + rand(-1, 1) * b.r * 0.5, y: b.y + rand(-1, 1) * b.r * 0.5, vx: -b.vx * 0.2 + rand(-30, 30), vy: -b.vy * 0.2 - 40, life: rand(0.25, 0.5), size: b.r * 2.2, size1: b.r * 0.6, sprites: S.fire });
       }
     }
-    this.fx.shake(3);
+    this.shake(3);
     if (this.t > this.dur) this.finish();
   }
   draw(ctx) {
@@ -455,18 +542,18 @@ function strokeBolt(ctx, b, scale) {
 }
 
 export class Chidori extends Effect {
-  constructor(fx) {
-    super(fx);
+  constructor(fx, opts) {
+    super(fx, opts);
     const h = this.pickHand();
-    this.a = h ? { ...h.palm } : { x: this.W * 0.5, y: this.H * 0.7 };
-    this.size = h ? h.size : this.W * 0.06;
+    this.a = h ? { ...h.palm } : this.xfPoint({ x: this.W * 0.5, y: this.H * 0.7 });
+    this.size = h ? h.size : this.W * 0.06 * (this.xf ? this.xf().s : 1);
     this.anchored = !!h; // cast by button/voice with no hand: stay put until a hand shows up
     this.dur = 11;
     this.lost = 0;
     this.bolts = [];
-    this.stopSnd = fx.sfx.chidoriLoop();
+    this.stopSnd = this.snd.chidoriLoop();
     this.onEnd = () => this.stopSnd();
-    fx.flash('#bfe4ff', 0.45, 3);
+    this.flash('#bfe4ff', 0.45, 3);
   }
   pickHand() {
     const hs = this.hands;
@@ -475,7 +562,7 @@ export class Chidori extends Effect {
   }
   update(dt) {
     super.update(dt);
-    const h = this.fx.nearestHand(this.a, this.anchored ? this.size * 6 : Infinity);
+    const h = this.nearestHand(this.a, this.anchored ? this.size * 6 : Infinity);
     if (h) {
       this.anchored = true;
       this.a.x = lerp(this.a.x, h.palm.x, 0.6);
@@ -488,7 +575,7 @@ export class Chidori extends Effect {
     this.bolts = [];
     const n = 7 + ((Math.random() * 6) | 0);
     for (let i = 0; i < n; i++) {
-      const long = Math.random() < 0.08;
+      const long = !this.silent && Math.random() < 0.08;
       const len = long ? rand(this.W * 0.25, this.W * 0.5) : s * rand(0.7, 2.4);
       const b = makeBolt(this.a.x, this.a.y, rand(0, TAU), len, rand(1.2, 2.4));
       this.bolts.push(b);
@@ -498,11 +585,11 @@ export class Chidori extends Effect {
       }
     }
     const S = this.S, ps = this.ps;
-    for (let i = ps.count(170, dt); i > 0; i--) {
+    for (let i = ps.count(170 * this.rateK, dt); i > 0; i--) {
       const a = rand(0, TAU), sp = rand(150, 520) * (s / 80);
       ps.emit({ x: this.a.x, y: this.a.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, ay: 500, life: rand(0.12, 0.35), size: rand(3, 8), sprite: S.spark });
     }
-    if (Math.random() < dt * 3) this.fx.shake(3);
+    if (Math.random() < dt * 3) this.shake(3);
   }
   draw(ctx) {
     const fade = this.t > this.dur - 0.6 ? (this.dur - this.t) / 0.6 : Math.min(1, this.t / 0.2);
@@ -524,10 +611,11 @@ export class Chidori extends Effect {
 /* ═════════════════════════ Rasengan ═════════════════════════ */
 
 export class Rasengan extends Effect {
-  constructor(fx, hand, startShuriken = false) {
-    super(fx);
-    this.a = hand ? this.handPoint(hand) : { x: this.W * 0.5, y: this.H * 0.65 };
-    this.size = hand ? hand.size : this.W * 0.07;
+  constructor(fx, hand, opts) {
+    super(fx, opts);
+    const k = this.xf ? this.xf().s : 1;
+    this.a = this.xfPoint(hand ? this.handPoint(hand) : { x: this.W * 0.5, y: this.H * 0.65 });
+    this.size = (hand ? hand.size : this.W * 0.07) * k;
     this.anchored = !!hand;
     this.R = 0;
     this.mode = null;
@@ -535,23 +623,22 @@ export class Rasengan extends Effect {
     this.ending = false;
     this.lost = 0; this.fist = 0; this.raised = 0;
     this.orbits = Array.from({ length: 26 }, () => ({ tilt: rand(0, Math.PI), phi: rand(0, TAU), sp: rand(5, 11) * (Math.random() < 0.5 ? 1 : -1), r: rand(0.55, 1.05), th: rand(0, TAU), w: rand(1, 2.6) }));
-    this.snd = fx.sfx.rasenganLoop();
-    this.onEnd = () => this.snd.stop();
-    if (startShuriken) this.evolve();
+    this.loop = this.snd.rasenganLoop();
+    this.onEnd = () => this.loop.stop();
   }
   handPoint(h) { return { x: h.palm.x + (h.pts[9].x - h.pts[0].x) * 0.25, y: h.palm.y + (h.pts[9].y - h.pts[0].y) * 0.25 }; }
   evolve() {
     if (this.shuriken) return;
     this.shuriken = true;
-    this.snd.shuriken();
-    this.fx.sfx.whoosh(0.8, true);
-    this.fx.flash('#d8f0ff', 0.4, 2.5);
-    this.fx.callout({ kanji: '風遁・螺旋手裏剣', title: 'Wind Style: Rasenshuriken', color: '#9fe6ff' });
+    this.loop.shuriken();
+    this.snd.whoosh(0.8, true);
+    this.flash('#d8f0ff', 0.4, 2.5);
+    if (!this.silent) this.fx.callout({ kanji: '風遁・螺旋手裏剣', title: 'Wind Style: Rasenshuriken', color: '#9fe6ff' });
   }
   release() { this.ending = true; }
   update(dt) {
     super.update(dt);
-    const h = this.fx.nearestHand(this.a, this.anchored ? this.size * 5 : Infinity);
+    const h = this.nearestHand(this.a, this.anchored ? this.size * 5 : Infinity);
     if (h) {
       this.anchored = true;
       const p = this.handPoint(h);
@@ -572,7 +659,7 @@ export class Rasengan extends Effect {
     const spd = this.shuriken ? 2.2 : 1;
     for (const o of this.orbits) o.th += o.sp * dt * spd;
     const S = this.S, ps = this.ps, R = this.R;
-    for (let i = ps.count(this.shuriken ? 140 : 70, dt); i > 0; i--) {
+    for (let i = ps.count((this.shuriken ? 140 : 70) * this.rateK, dt); i > 0; i--) {
       const a = rand(0, TAU), r = R * rand(1.4, 2.2);
       const x = this.a.x + Math.cos(a) * r, y = this.a.y + Math.sin(a) * r;
       const tx = -Math.sin(a), ty = Math.cos(a);
@@ -645,14 +732,23 @@ export class ShadowClones extends Effect {
     this.needsSeg = true;
     this.wantsHistory = true;
     this.hasBack = true;
-    this.dur = 24;
+    this.dur = 45;
+    // Small frame delays keep each clone close to your pose, so jutsu they copy line up with them.
     this.clones = [
-      { dx: -0.27, s: 0.86, delay: 3, at: 0.05 },
-      { dx: 0.27, s: 0.86, delay: 6, at: 0.17 },
-      { dx: -0.5, s: 0.72, delay: 9, at: 0.29 },
-      { dx: 0.5, s: 0.72, delay: 12, at: 0.41 },
+      { dx: -0.27, s: 0.86, delay: 2, at: 0.05 },
+      { dx: 0.27, s: 0.86, delay: 3, at: 0.17 },
+      { dx: -0.5, s: 0.72, delay: 4, at: 0.29 },
+      { dx: 0.5, s: 0.72, delay: 5, at: 0.41 },
     ];
     this.ending = false;
+  }
+  get active() { return !this.done && !this.ending && this.clones.some(c => c.shown); }
+  /** Where clone i sits: its image is the frame scaled by s about your feet and shifted sideways. */
+  xfFor(i) {
+    const c = this.clones[i];
+    if (this.done || this.ending || !c || !c.shown) return null;
+    const cx = this.cx(), W = this.W, H = this.H;
+    return { s: c.s, ox: cx + c.dx * W - cx * c.s, oy: H - H * c.s };
   }
   cx() { return this.face ? this.face.nose.x : this.W / 2; }
   cloneCenter(c) {
@@ -1315,6 +1411,7 @@ export class Kamui extends Effect {
   constructor(fx, x, y) {
     super(fx);
     this.x = x; this.y = y;
+    this.needsSnapshot = true;
     this.dur = 3.1;
     this.Rmax = Math.min(this.W, this.H) * 0.3;
     fx.sfx.vortex(2.7);
@@ -1389,10 +1486,46 @@ export class Kamui extends Effect {
 
 /* ═════════════════════════ Susanoo ═════════════════════════ */
 
+/** Tileable flame texture in a given colour: soft blobs of varying brightness, wrapped at the edges. */
+const flameTexCache = new Map();
+function flameTexture(color) {
+  if (flameTexCache.has(color)) return flameTexCache.get(color);
+  const S = 256, c = document.createElement('canvas');
+  c.width = c.height = S;
+  const x = c.getContext('2d');
+  const rnd = mulberry32(777);
+  const h = color.replace('#', '');
+  const n = parseInt(h, 16), r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  for (let i = 0; i < 140; i++) {
+    const cx = rnd() * S, cy = rnd() * S, rr = 10 + rnd() * 46;
+    const hot = rnd() < 0.25;
+    const a = 0.25 + rnd() * 0.4;
+    const col = hot ? `${Math.min(255, r + 90)},${Math.min(255, g + 90)},${Math.min(255, b + 60)}` : `${r},${g},${b}`;
+    for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) {
+      if (cx + ox + rr < 0 || cx + ox - rr > S || cy + oy + rr < 0 || cy + oy - rr > S) continue;
+      const grd = x.createRadialGradient(cx + ox, cy + oy, 0, cx + ox, cy + oy, rr);
+      grd.addColorStop(0, `rgba(${col},${a})`);
+      grd.addColorStop(1, `rgba(${col},0)`);
+      x.fillStyle = grd;
+      x.fillRect(cx + ox - rr, cy + oy - rr, rr * 2, rr * 2);
+    }
+  }
+  flameTexCache.set(color, c);
+  return c;
+}
+
+/**
+ * Susanoo: a spectral guardian that manifests around you in stages: chakra flames, then the spine
+ * and ribs, then the arms and helm, then armour. Each eye has its own original guardian, sharing only
+ * its colour and mood with the character: warden (crimson, ward-disc), storm (violet, spiked helm and
+ * bow of light), tide (cyan, visor and twin blades), gale (green, wing fins), titan (blue, horned
+ * crown, four arms). Drawn in face-relative units (1 = face width) with the origin at the chin.
+ */
 export class Susanoo extends Effect {
-  constructor(fx, color) {
+  constructor(fx, color, variant) {
     super(fx);
     this.color = color;
+    this.variant = variant || 'storm';
     this.needsSeg = true;
     this.hasBack = true;
     this.on = true;
@@ -1400,71 +1533,340 @@ export class Susanoo extends Effect {
     this.stopSnd = fx.sfx.auraLoop();
     this.onEnd = () => this.stopSnd();
     fx.sfx.activate();
-    fx.shake(12);
+    fx.sfx.rumble(1.4);
+    fx.shake(14);
+    fx.flash(color, 0.22, 2);
   }
+
+  setStyle(color, variant) {
+    if (color === this.color && variant === this.variant) return;
+    this.color = color;
+    this.variant = variant || this.variant;
+    this.t = Math.min(this.t, 1.0); // re-form the new guardian's upper body and armour
+  }
+
   toggleOff() {
+    if (!this.on) return;
     this.on = false;
     this.fx.sfx.deactivate();
+    // The guardian breaks apart into rising embers.
+    const fr = this.frame();
+    const ps = this.ps, spr = flameSprite(this.color);
+    for (let i = 0; i < 70 * ps.scale; i++) {
+      const lx = rand(-2.4, 2.4), ly = rand(-2.6, 3);
+      const p = this.toScreen(fr, lx, ly);
+      ps.emit({ x: p.x, y: p.y, vx: rand(-40, 40), vy: rand(-220, -80), life: rand(0.6, 1.2), size: rand(14, 30) * fr.u / 110, size1: 2, sprite: spr, alpha: 0.7 });
+    }
   }
-  setColor(c) { this.color = c; }
+
+  /**
+   * The guardian's frame: origin at the chin, unit u a bit under one face width. The helm sits just
+   * above your head and is nudged down if it would leave the top of the screen.
+   */
+  frame() {
+    const f = this.face;
+    const fr = f ? { x: f.chin.x, y: f.chin.y, rot: f.roll, u: f.faceW * 0.68 }
+      : { x: this.W / 2, y: this.H * 0.55, rot: 0, u: this.W * 0.08 };
+    let helmY = -2.05;
+    if (f) helmY = -Math.hypot(f.top.x - f.chin.x, f.top.y - f.chin.y) / fr.u - 0.6;
+    const r = 1.05 * fr.u, top = fr.y + helmY * fr.u * Math.cos(fr.rot) - r;
+    const minTop = this.H * 0.03;
+    if (top < minTop) helmY += (minTop - top) / fr.u;
+    fr.helmY = helmY;
+    return fr;
+  }
+
+  toScreen(fr, lx, ly) {
+    const c = Math.cos(fr.rot), s = Math.sin(fr.rot);
+    return { x: fr.x + (lx * c - ly * s) * fr.u, y: fr.y + (lx * s + ly * c) * fr.u };
+  }
+
   update(dt) {
     super.update(dt);
-    this.k = clamp(this.k + (this.on ? dt * 1.4 : -dt * 2));
+    this.k = clamp(this.k + (this.on ? dt * 1.6 : -dt * 1.3));
     if (!this.on && this.k <= 0) { this.finish(); return; }
-    const ps = this.ps, spr = glowSprite(this.color, 48, 0.2);
+    const ps = this.ps, spr = flameSprite(this.color);
+    const fr = this.frame();
     const edges = this.fx.mask && this.fx.mask.ready ? this.fx.mask.edges : null;
-    for (let i = ps.count(110 * this.k, dt); i > 0; i--) {
+    const sizeK = fr.u / 110;
+    // Chakra flames licking up off your silhouette (or around you when there is no body outline yet).
+    for (let i = ps.count(150 * this.k, dt); i > 0; i--) {
       let x, y;
       if (edges && edges.length) {
         const e = edges[(Math.random() * edges.length) | 0];
         x = e.x; y = e.y;
-      } else if (this.face) {
-        const a = rand(Math.PI, TAU);
-        x = this.face.center.x + Math.cos(a) * this.face.faceW * 1.4;
-        y = this.face.center.y + Math.sin(a) * this.face.faceH * 1.2 + this.face.faceH * 0.6;
-      } else continue;
-      ps.emit({ x, y, vx: rand(-25, 25), vy: rand(-170, -70), life: rand(0.45, 0.95), size: rand(16, 34) * (this.W / 1280), size1: 2, sprite: spr, alpha: 0.75 * this.k });
+      } else {
+        const p = this.toScreen(fr, rand(-1.6, 1.6), rand(-1.3, 2.6));
+        x = p.x; y = p.y;
+      }
+      ps.emit({ x, y, vx: rand(-25, 25), vy: rand(-230, -110) * sizeK, life: rand(0.45, 0.85), size: rand(26, 50) * sizeK, size1: 4, sprite: spr, alpha: 0.6 * this.k });
+    }
+    // Embers drifting off the guardian's frame once it has formed.
+    if (this.t > 1.2) {
+      for (let i = ps.count(25 * this.k, dt); i > 0; i--) {
+        const p = this.toScreen(fr, rand(-2.2, 2.2), rand(-2.8, 3));
+        ps.emit({ x: p.x, y: p.y, vx: rand(-15, 15), vy: rand(-90, -40), life: rand(0.6, 1.2), size: rand(4, 9) * sizeK, sprite: glowSprite(this.color, 32, 0.3), alpha: 0.8 * this.k });
+      }
     }
   }
+
   drawBack(ctx) {
     const flick = 0.85 + 0.15 * Math.sin(this.t * 17) * Math.sin(this.t * 7.3);
     const cx = this.face ? this.face.nose.x : this.W / 2;
-    const ok = this.fx.drawAura(ctx, this.color, 1.08, 18, 0.85 * this.k * flick, cx);
-    this.fx.drawAura(ctx, this.color, 1.18, 34, 0.4 * this.k, cx);
-    this.drawRibs(ctx, ok ? 0.75 : 0.45);
+    const ok = this.fx.drawAura(ctx, this.color, 1.08, 18, 0.9 * this.k * flick, cx);
+    this.fx.drawAura(ctx, this.color, 1.22, 34, 0.42 * this.k * (0.8 + 0.2 * Math.sin(this.t * 2.2)), cx);
+    this.drawGuardian(ctx, ok ? 0.9 : 0);
   }
-  drawRibs(ctx, alpha) {
-    const f = this.face;
-    if (!f) return;
-    const u = f.faceW, cx = f.chin.x, top = f.chin.y + f.faceH * 0.15;
+
+  draw(ctx) {
+    // Without a body outline the guardian can't sit behind you, so draw a fainter version in front.
+    if (!(this.fx.mask && this.fx.mask.ready)) this.drawGuardian(ctx, 0.42);
+  }
+
+  drawGuardian(ctx, alpha) {
+    if (alpha <= 0) return;
+    const fr = this.frame(), t = this.t;
+    const breathe = 1 + 0.012 * Math.sin(t * 2.2);
+    const flick = 0.88 + 0.12 * Math.sin(t * 13) * Math.sin(t * 5.1);
     ctx.save();
+    ctx.translate(fr.x, fr.y);
+    ctx.rotate(fr.rot);
+    ctx.scale(fr.u * breathe, fr.u * breathe);
     ctx.globalCompositeOperation = 'lighter';
-    ctx.globalAlpha = alpha * this.k * (0.85 + 0.15 * Math.sin(this.t * 9));
-    ctx.strokeStyle = this.color;
     ctx.lineCap = 'round';
-    const pass = (lw, a) => {
-      ctx.lineWidth = lw;
-      ctx.globalAlpha = alpha * this.k * a;
-      ctx.beginPath();
-      ctx.moveTo(cx, top);
-      ctx.lineTo(cx, top + u * 2.4);
-      for (let i = 0; i < 6; i++) {
-        const y = top + u * 0.3 + i * u * 0.34;
-        const rx = u * (1.6 - i * 0.08), ry = u * 0.5;
-        for (const sx of [-1, 1]) {
-          ctx.moveTo(cx + sx * u * 0.08, y);
-          ctx.quadraticCurveTo(cx + sx * rx * 0.95, y - ry * 0.7, cx + sx * rx, y + ry * 0.55);
-        }
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = this.color;
+    ctx.fillStyle = this.color;
+    const A = alpha * this.k * flick;
+    const stage = (start, len) => clamp((t - start) / len);
+
+    // Strokes are drawn twice: a wide faint glow and a bright core. A dash offset "grows" each bone.
+    const bone = (path, w, p) => {
+      if (p <= 0) return;
+      ctx.setLineDash([14, 14]);
+      ctx.lineDashOffset = 14 * (1 - p);
+      ctx.globalAlpha = A * 0.2;
+      ctx.lineWidth = w * 3.2;
+      path(); ctx.stroke();
+      ctx.globalAlpha = A * 0.85;
+      ctx.lineWidth = w;
+      path(); ctx.stroke();
+      ctx.setLineDash([]);
+    };
+    const plate = (path, p, fillA = 0.12) => {
+      if (p <= 0) return;
+      ctx.globalAlpha = A * fillA * p;
+      path(); ctx.fill();
+      ctx.globalAlpha = A * 0.7 * p;
+      ctx.lineWidth = 0.035;
+      path(); ctx.stroke();
+    };
+    const line = (x0, y0, x1, y1) => () => { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); };
+    const quad = (x0, y0, cx, cy, x1, y1) => () => { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.quadraticCurveTo(cx, cy, x1, y1); };
+    this.fr = fr;
+
+    // Behind everything: the variant's large motif (ward-disc, wings, bow).
+    this.drawMotifBack(ctx, A, stage(1.9, 0.9), bone, plate);
+    // The towering chakra-flame body: translucent masses filled with rising flame texture.
+    this.drawFlameBody(ctx, A, fr, stage(0.15, 1.6));
+    this.drawSwirls(ctx, A, stage(1.6, 1.0));
+
+    // Spine and ribs.
+    bone(line(0, 0.15, 0, 3.0), 0.07, stage(0.25, 0.45));
+    for (let i = 0; i < 6; i++) {
+      const y = 0.55 + i * 0.34, rx = 1.6 - i * 0.08, p = stage(0.45 + i * 0.09, 0.35);
+      for (const sx of [-1, 1]) bone(quad(sx * 0.08, y, sx * rx * 0.95, y - 0.35, sx * rx, y + 0.28), 0.06, p);
+    }
+    // Shoulders, collarbones and arms.
+    const pu = stage(1.0, 0.6);
+    for (const sx of [-1, 1]) {
+      bone(quad(sx * 0.1, 0.22, sx * 1.0, -0.12, sx * 1.85, -0.02), 0.06, pu);
+      bone(line(sx * 2.05, 0.25, sx * 2.35, 1.85), 0.08, pu);
+      bone(line(sx * 2.35, 1.95, sx * 1.95, 3.2), 0.07, stage(1.25, 0.6));
+      if (pu > 0) {
+        ctx.globalAlpha = A * 0.6 * pu;
+        ctx.lineWidth = 0.05;
+        ctx.beginPath(); ctx.arc(sx * 2.0, 0.05, 0.2, 0, TAU); ctx.stroke();
       }
+    }
+    if (this.variant === 'titan') {
+      const p2 = stage(1.5, 0.7);
       for (const sx of [-1, 1]) {
-        ctx.moveTo(cx + sx * u * 0.1, top - u * 0.05);
-        ctx.quadraticCurveTo(cx + sx * u * 1.2, top - u * 0.35, cx + sx * u * 2.0, top - u * 0.05);
+        bone(line(sx * 1.6, 0.8, sx * 2.9, 1.5), 0.07, p2);
+        bone(line(sx * 2.9, 1.55, sx * 3.35, 0.45), 0.06, stage(1.75, 0.6));
+      }
+    }
+    // Helm with glowing eyes, then shoulder plates and the variant's front details.
+    this.drawHelm(ctx, A, stage(1.4, 0.7), bone, plate);
+    this.drawArmour(ctx, A, stage(1.9, 0.9), bone, plate);
+    ctx.restore();
+  }
+
+  /**
+   * Flame body: big translucent masses (head, shoulders, torso) filled with a flame texture that
+   * scrolls upward, so the guardian reads as a giant made of chakra fire rather than a wireframe.
+   */
+  drawFlameBody(ctx, A, fr, p) {
+    if (p <= 0) return;
+    const tex = flameTexture(this.color);
+    const pat = ctx.createPattern(tex, 'repeat');
+    if (pat && pat.setTransform) {
+      const k = 1.4 / fr.u;
+      pat.setTransform(new DOMMatrix().translate(0, -(this.t * 0.55) % 4).scale(k, k));
+    }
+    const hy = fr.helmY;
+    const masses = () => {
+      ctx.beginPath();
+      ctx.ellipse(0, hy, 1.25, 1.35, 0, 0, TAU);
+      ctx.moveTo(2.9, 0.2);
+      ctx.ellipse(1.95, 0.15, 0.95, 0.7, 0.25, 0, TAU);
+      ctx.moveTo(-1.0, 0.15);
+      ctx.ellipse(-1.95, 0.15, 0.95, 0.7, -0.25, 0, TAU);
+      ctx.moveTo(-2.35, -0.1);
+      ctx.bezierCurveTo(-2.8, 1.4, -2.2, 3.0, -1.4, 3.6);
+      ctx.lineTo(1.4, 3.6);
+      ctx.bezierCurveTo(2.2, 3.0, 2.8, 1.4, 2.35, -0.1);
+      ctx.quadraticCurveTo(0, hy + 1.25, -2.35, -0.1);
+    };
+    const pulse = 0.85 + 0.15 * Math.sin(this.t * 2.6);
+    ctx.save();
+    ctx.globalAlpha = A * 0.7 * p * pulse;
+    ctx.fillStyle = pat || this.color;
+    masses();
+    ctx.fill('nonzero');
+    // A soft inner glow so the centre of the body is denser than its edges.
+    ctx.globalAlpha = A * 0.3 * p;
+    const g = ctx.createRadialGradient(0, 0.6, 0.3, 0, 0.6, 3.6);
+    g.addColorStop(0, this.color);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    masses();
+    ctx.fill('nonzero');
+    ctx.restore();
+  }
+
+  /** Flowing spiral flame patterns on the shoulders and sides, turning slowly. */
+  drawSwirls(ctx, A, p) {
+    if (p <= 0) return;
+    const spots = [[2.05, 0.15, 0.55, 1], [-2.05, 0.15, 0.55, -1], [1.6, 2.2, 0.45, -1], [-1.6, 2.2, 0.45, 1]];
+    ctx.save();
+    ctx.lineWidth = 0.035;
+    for (const [x, y, r, dir] of spots) {
+      ctx.globalAlpha = A * 0.65 * p;
+      ctx.beginPath();
+      for (let s = 0; s <= 48; s++) {
+        const th = (s / 48) * 3.4 * Math.PI;
+        const rr = r * (1 - s / 56);
+        const a = dir * th + this.t * 0.6 * dir;
+        const px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr * 0.8;
+        if (s) ctx.lineTo(px, py); else ctx.moveTo(px, py);
       }
       ctx.stroke();
-    };
-    pass(u * 0.22, 0.25);
-    pass(u * 0.07, 0.9);
+    }
     ctx.restore();
+  }
+
+  drawHelm(ctx, A, p, bone, plate) {
+    if (p <= 0) return;
+    const v = this.variant, cy = this.fr ? this.fr.helmY : -2.05;
+    const arc = (r) => () => { ctx.beginPath(); ctx.arc(0, cy, r, Math.PI * 0.95, Math.PI * 2.05); };
+    bone(arc(1.05), 0.07, p);
+    bone(() => { ctx.beginPath(); ctx.moveTo(-1.02, cy + 0.15); ctx.quadraticCurveTo(-0.9, cy + 1.0, 0, cy + 1.15); ctx.quadraticCurveTo(0.9, cy + 1.0, 1.02, cy + 0.15); }, 0.06, p);
+    // Glowing eyes: a hot core inside a soft halo, brighter than the body around them.
+    for (const sx of [-1, 1]) {
+      ctx.globalAlpha = A * 0.45 * p;
+      ctx.drawImage(glowSprite('#ffd27a', 48, 0.2), sx * 0.38 - 0.42, cy + 0.1 - 0.42, 0.84, 0.84);
+      ctx.globalAlpha = A * p;
+      ctx.fillStyle = '#fff1c4';
+      ctx.beginPath();
+      ctx.ellipse(sx * 0.38, cy + 0.1, 0.22, 0.08, sx * -0.25, 0, TAU);
+      ctx.fill();
+    }
+    ctx.fillStyle = this.color;
+    if (v === 'warden') {
+      bone(() => { ctx.beginPath(); ctx.moveTo(0, cy - 1.05); ctx.quadraticCurveTo(0.15, cy - 1.6, -0.25, cy - 1.95); }, 0.07, p);
+      for (const sx of [-1, 1]) plate(() => { ctx.beginPath(); ctx.moveTo(sx * 1.0, cy + 0.1); ctx.quadraticCurveTo(sx * 1.25, cy + 0.7, sx * 0.6, cy + 1.05); ctx.lineTo(sx * 0.75, cy + 0.2); ctx.closePath(); }, p);
+    } else if (v === 'storm') {
+      for (const sx of [-1, 1]) {
+        for (let i = 0; i < 3; i++) {
+          const a = -0.4 - i * 0.35;
+          const bx = sx * Math.cos(a) * 1.0, by = cy + Math.sin(a) * 1.0;
+          plate(() => { ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + sx * (0.5 + i * 0.15), by - 0.9 + i * 0.2); ctx.lineTo(bx - sx * 0.12, by + 0.15); ctx.closePath(); }, p, 0.18);
+        }
+      }
+    } else if (v === 'tide') {
+      plate(() => { ctx.beginPath(); ctx.moveTo(-0.95, cy - 0.05); ctx.lineTo(0, cy + 0.75); ctx.lineTo(0.95, cy - 0.05); ctx.lineTo(0, cy + 0.25); ctx.closePath(); }, p, 0.16);
+      bone(() => { ctx.beginPath(); ctx.moveTo(0, cy - 1.05); ctx.lineTo(0, cy - 1.45); }, 0.05, p);
+    } else if (v === 'gale') {
+      for (const sx of [-1, 1]) {
+        for (let i = 0; i < 3; i++) {
+          plate(() => { ctx.beginPath(); ctx.moveTo(sx * 0.8, cy - 0.4 + i * 0.3); ctx.quadraticCurveTo(sx * 1.6, cy - 0.9 + i * 0.35, sx * (2.0 - i * 0.2), cy - 0.2 + i * 0.4); ctx.quadraticCurveTo(sx * 1.4, cy - 0.15 + i * 0.35, sx * 0.8, cy - 0.25 + i * 0.3); ctx.closePath(); }, p, 0.14);
+        }
+      }
+    } else if (v === 'titan') {
+      for (const sx of [-1, 1]) {
+        bone(() => { ctx.beginPath(); ctx.moveTo(sx * 0.75, cy - 0.7); ctx.quadraticCurveTo(sx * 1.6, cy - 1.3, sx * 1.35, cy - 2.4); }, 0.1, p);
+      }
+      bone(() => { ctx.beginPath(); ctx.moveTo(-0.6, cy - 0.85); ctx.lineTo(0, cy - 1.25); ctx.lineTo(0.6, cy - 0.85); }, 0.05, p);
+    }
+  }
+
+  drawArmour(ctx, A, p, bone, plate) {
+    if (p <= 0) return;
+    const v = this.variant;
+    for (const sx of [-1, 1]) {
+      // Shoulder plates, shaped per guardian.
+      if (v === 'storm') {
+        plate(() => { ctx.beginPath(); ctx.moveTo(sx * 1.55, -0.1); ctx.lineTo(sx * 2.7, -0.75); ctx.lineTo(sx * 2.45, 0.1); ctx.lineTo(sx * 2.75, 0.55); ctx.lineTo(sx * 1.7, 0.35); ctx.closePath(); }, p, 0.14);
+      } else if (v === 'titan') {
+        for (let i = 0; i < 3; i++) plate(() => { ctx.beginPath(); ctx.ellipse(sx * (2.0 + i * 0.12), -0.05 + i * 0.32, 0.75 - i * 0.1, 0.3, sx * 0.35, 0, TAU); }, p, 0.1);
+      } else if (v === 'tide') {
+        plate(() => { ctx.beginPath(); ctx.moveTo(sx * 1.6, -0.15); ctx.lineTo(sx * 2.55, -0.3); ctx.lineTo(sx * 2.6, 0.45); ctx.lineTo(sx * 1.75, 0.3); ctx.closePath(); }, p, 0.12);
+        // Twin blades held low.
+        bone(() => { ctx.beginPath(); ctx.moveTo(sx * 1.95, 3.2); ctx.lineTo(sx * 1.05, 4.6); }, 0.09, p);
+      } else {
+        plate(() => { ctx.beginPath(); ctx.ellipse(sx * 2.05, 0.0, 0.7, 0.42, sx * 0.3, Math.PI, TAU); ctx.closePath(); }, p, 0.12);
+      }
+    }
+  }
+
+  drawMotifBack(ctx, A, p, bone, plate) {
+    if (p <= 0) return;
+    const v = this.variant, t = this.t;
+    if (v === 'warden') {
+      ctx.save();
+      ctx.translate(0, 0.9);
+      ctx.rotate(t * 0.25);
+      bone(() => { ctx.beginPath(); ctx.arc(0, 0, 2.75, 0, TAU); }, 0.05, p);
+      bone(() => { ctx.beginPath(); ctx.arc(0, 0, 2.35, 0, TAU); }, 0.03, p);
+      ctx.globalAlpha = A * 0.55 * p;
+      ctx.lineWidth = 0.04;
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * TAU;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * 2.4, Math.sin(a) * 2.4);
+        ctx.lineTo(Math.cos(a) * 2.7, Math.sin(a) * 2.7);
+        ctx.stroke();
+      }
+      ctx.restore();
+    } else if (v === 'storm') {
+      // A bow of light at your left side, its string shimmering.
+      bone(() => { ctx.beginPath(); ctx.moveTo(-2.9, -1.3); ctx.quadraticCurveTo(-3.9, 0.85, -2.9, 3.0); }, 0.08, p);
+      ctx.globalAlpha = A * (0.35 + 0.25 * Math.sin(t * 9)) * p;
+      ctx.lineWidth = 0.025;
+      ctx.beginPath(); ctx.moveTo(-2.9, -1.3); ctx.lineTo(-2.9, 3.0); ctx.stroke();
+    } else if (v === 'gale') {
+      for (const sx of [-1, 1]) {
+        for (let i = 0; i < 4; i++) {
+          const sway = Math.sin(t * 1.6 + i) * 0.08;
+          const a = -1.2 + i * 0.32 + sway;
+          const ex = sx * (1.8 + Math.cos(a) * 2.4), ey = Math.sin(a) * 2.4;
+          plate(() => { ctx.beginPath(); ctx.moveTo(sx * 1.8, 0); ctx.quadraticCurveTo(sx * 1.8 + sx * Math.cos(a - 0.25) * 1.6, Math.sin(a - 0.25) * 1.6, ex, ey); ctx.quadraticCurveTo(sx * 1.8 + sx * Math.cos(a + 0.2) * 1.2, Math.sin(a + 0.2) * 1.2, sx * 1.8, 0.15); ctx.closePath(); }, p, 0.1);
+        }
+      }
+    } else if (v === 'titan') {
+      bone(() => { ctx.beginPath(); ctx.arc(0, this.fr.helmY, 1.7, Math.PI * 1.1, Math.PI * 1.9); }, 0.04, p);
+    }
   }
 }
 
@@ -1474,6 +1876,7 @@ export class ShinraTensei extends Effect {
   constructor(fx, origin) {
     super(fx);
     this.o = origin || { x: this.W / 2, y: this.H / 2 };
+    this.needsSnapshot = true;
     this.dur = 2.1;
     this.maxR = Math.hypot(this.W, this.H);
     fx.sfx.boom(1.5);
@@ -1606,6 +2009,27 @@ export class ByakuganSight extends Effect {
 
 /* ═════════════════════════ Seal burst ═════════════════════════ */
 
+const SEAL_GLYPH_FONT = 96;
+const glyphCache = new Map();
+function sealGlyph(kanji) {
+  if (glyphCache.has(kanji)) return glyphCache.get(kanji);
+  const c = document.createElement('canvas');
+  c.width = c.height = 160;
+  const x = c.getContext('2d');
+  x.font = `${SEAL_GLYPH_FONT}px "Yuji Syuku", "Yu Mincho", serif`;
+  x.textAlign = 'center';
+  x.textBaseline = 'middle';
+  x.shadowColor = '#4aa8ff';
+  x.shadowBlur = 24;
+  x.lineWidth = SEAL_GLYPH_FONT * 0.1;
+  x.strokeStyle = 'rgba(0,10,30,0.8)';
+  x.strokeText(kanji, 80, 80);
+  x.fillStyle = '#fff';
+  x.fillText(kanji, 80, 80);
+  glyphCache.set(kanji, c);
+  return c;
+}
+
 export class SealBurst extends Effect {
   constructor(fx, seal, at) {
     super(fx);
@@ -1621,20 +2045,13 @@ export class SealBurst extends Effect {
   update(dt) { super.update(dt); if (this.t > this.dur) this.finish(); }
   drawTop(ctx) {
     const k = this.t / this.dur;
-    const size = Math.round(this.H * 0.11 * (1 + 0.35 * (1 - easeOut(k * 2))));
+    const img = sealGlyph(this.seal.kanji);
+    const size = this.H * 0.11 * (1 + 0.35 * (1 - easeOut(k * 2)));
+    const d = size * (img.width / SEAL_GLYPH_FONT);
+    const y = this.at.y - this.H * 0.12 - k * 30;
     ctx.save();
     ctx.globalAlpha = 1 - easeIn(k);
-    ctx.font = `${size}px "Yuji Syuku", "Yu Mincho", serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.shadowColor = '#4aa8ff';
-    ctx.shadowBlur = 24;
-    ctx.lineWidth = size * 0.1;
-    ctx.strokeStyle = 'rgba(0,10,30,0.8)';
-    const y = this.at.y - this.H * 0.12 - k * 30;
-    ctx.strokeText(this.seal.kanji, this.at.x, y);
-    ctx.fillStyle = '#fff';
-    ctx.fillText(this.seal.kanji, this.at.x, y);
+    ctx.drawImage(img, this.at.x - d / 2, y - d / 2, d, d);
     ctx.restore();
   }
 }

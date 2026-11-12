@@ -18,7 +18,7 @@ The camera only works from `http://localhost` (or HTTPS), so don't open `index.h
 
 **Eyes (left rail).** 16 presets (Itachi, Sasuke EMS, Sasuke Rinnegan, Kakashi, Obito, Madara Six Paths, Kaguya …). **Mix each eye** opens a matrix where any pattern can go in the left eye, the right eye or a third eye on the forehead, plus size, glow, spin and opacity.
 
-Patterns are mapped onto your tracked iris and clipped by your eyelids, so they blink with you. The Byakugan adds bulging veins around the eyes.
+Patterns are mapped onto your tracked iris and clipped by your eyelids, so they blink with you. They behave like contact lenses: soft edges, your real eye's shading and reflections showing through, still until you switch eyes (then they spin up briefly). The Byakugan turns the iris near-white and grows raised veins from the outer corners down your cheeks; they stay on your face and fade out naturally.
 
 **Jutsu (right rail).** Each seal lights up as you form it; **Cast** fires a jutsu without seals.
 
@@ -36,12 +36,18 @@ Patterns are mapped onto your tracked iris and clipped by your eyelids, so they 
 **Eye abilities.** These unlock based on the eyes you're wearing:
 
 - **Tsukuyomi**, **Amaterasu** (wink one eye and look at a spot), **Kamui** (point and hold): any Mangekyō.
-- **Susanoo** aura: Mangekyō or Rinnegan.
+- **Susanoo**: Mangekyō or Rinnegan. A towering chakra-flame guardian builds up behind you in stages. Each eye has its own original guardian in its signature colour: warden (crimson), storm (violet), tide (cyan), gale (green), titan (blue).
 - **Shinra Tensei** (push a palm at the camera): Rinnegan.
 - **All-seeing sight**: Byakugan.
 - **Infinite Tsukuyomi**: Rinne-Sharingan.
 
-**Also:** photo and video capture (with sound), optional voice commands (“Fireball!”, “Amaterasu!”, “Kai!”), and procedural sound effects.
+**Shadow clones join in.** While your clones are out, Fireball, Phoenix Flower, Chidori and Rasengan are cast by every clone too, and the clones wear your eyes.
+
+**Character songs (optional).** The app has no built-in music. If you own a song you want for a character, open **Settings → Character songs** and choose the file. It plays when you wear that character's eyes, stays in your browser (IndexedDB), and is never uploaded.
+
+**Also:** photo and video capture (with sound and music), optional voice commands (“Fireball!”, “Amaterasu!”, “Kai!”), and procedural sound effects.
+
+**Runs on slower laptops.** Effect detail defaults to *Auto*. If frames run slow, it lowers the render resolution and particle count, caps the frame rate, and has the face and hand trackers take turns. You can pin Low, Medium or High in Settings.
 
 ## How seal recognition works
 
@@ -75,6 +81,7 @@ js/seals.js       easy-seal rules, k-NN trainer, stabiliser, sequence matcher
 js/effects.js     every jutsu / ability effect and the FX compositor
 js/particles.js   sprites and pooled particle system
 js/audio.js       Web Audio sound effects
+js/music.js       your own optional character songs (IndexedDB)
 js/voice.js       Web Speech voice commands
 js/ui.js          DOM: rails, sheets, guide, trainer, settings
 server.js         zero-dependency static server
@@ -88,6 +95,7 @@ server.js         zero-dependency static server
   - The models are pinned to fixed versions.
 - **Voice commands are off by default.** If you turn them on, your browser's speech recognition handles the audio and may send it to an online service (Google, in Chrome).
 - **Content-Security-Policy.** Scripts may load only from this site and jsDelivr, and network requests may go only to jsDelivr and Google model storage. The page can't be framed, and camera and microphone access are limited to this site (see `index.html` and `vercel.json`).
+- **Your own songs** are stored in your browser (IndexedDB) and played from local blob URLs; they are never uploaded.
 - **Seal recordings** stay in your browser's local storage. Imported files are validated: known seals only, fixed-size numeric data, bounded counts.
 - **`server.js`** is for local use only. It binds to 127.0.0.1, serves only the web files, and refuses hidden files, path traversal and malformed paths.
 

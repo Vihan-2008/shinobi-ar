@@ -94,6 +94,28 @@ export function blackFlameSprite(size = 96, seed = 1) {
   return c;
 }
 
+/** Tall teardrop flame tongue for chakra-fire auras (drawn in a square, point up). */
+export function flameSprite(color, size = 64) {
+  const key = `fl|${color}|${size}`;
+  if (spriteCache.has(key)) return spriteCache.get(key);
+  const [r, g, b] = hexToRgb(color);
+  const c = mk(size), x = c.getContext('2d'), h = size / 2;
+  x.save();
+  x.translate(h, h * 1.25);
+  x.scale(0.42, 1);
+  const grd = x.createRadialGradient(0, 0, 0, 0, 0, h * 0.95);
+  grd.addColorStop(0, `rgba(${Math.min(255, r + 120)},${Math.min(255, g + 120)},${Math.min(255, b + 120)},0.95)`);
+  grd.addColorStop(0.35, `rgba(${r},${g},${b},0.7)`);
+  grd.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  x.fillStyle = grd;
+  x.beginPath();
+  x.arc(0, 0, h * 0.95, 0, Math.PI * 2);
+  x.fill();
+  x.restore();
+  spriteCache.set(key, c);
+  return c;
+}
+
 export function rockSprite(size = 32, seed = 1) {
   const key = `r|${size}|${seed}`;
   if (spriteCache.has(key)) return spriteCache.get(key);

@@ -28,6 +28,8 @@ export class Tracker {
     this.seg = null;
     this.segLoading = null;
     this.lastTs = 0;
+    this.ms = { face: 0, hands: 0, seg: 0 };
+    this.segCanvas = null;
   }
 
   async initFace() {
@@ -75,30 +77,52 @@ export class Tracker {
     return this.lastTs;
   }
 
-  detect(video, wantSeg, onMask) {
-    const ts = this.nextTs();
-    let face = null, hands = null;
-    if (this.face) {
-      const r = this.face.detectForVideo(video, ts);
-      face = r.faceLandmarks && r.faceLandmarks.length ? r.faceLandmarks[0] : null;
+  /** Exponential moving average of how long each model takes, used to throttle on slow machines. */
+  time(key, t0) {
+    const ms = performance.now() - t0;
+    this.ms[key] = this.ms[key] ? this.ms[key] * 0.85 + ms * 0.15 : ms;
+  }
+
+  detectFace(video) {
+    if (!this.face) return undefined;
+    const t0 = performance.now();
+    const r = this.face.detectForVideo(video, this.nextTs());
+    this.time('face', t0);
+    return r.faceLandmarks && r.faceLandmarks.length ? r.faceLandmarks[0] : null;
+  }
+
+  detectHands(video) {
+    if (!this.hands) return undefined;
+    const t0 = performance.now();
+    const r = this.hands.detectForVideo(video, this.nextTs());
+    this.time('hands', t0);
+    return (r.landmarks || []).map((lm, i) => ({ lm, world: r.worldLandmarks ? r.worldLandmarks[i] : null }));
+  }
+
+  /**
+   * The selfie model works at 256 px internally, so feed it a small copy of the frame. That keeps
+   * the upload cheap and, more importantly, makes the mask read-back tiny instead of full HD.
+   */
+  segment(video, onMask) {
+    if (!this.seg) return;
+    const vw = video.videoWidth || video.width, vh = video.videoHeight || video.height;
+    if (!vw || !vh) return;
+    const sw = 256, sh = Math.max(1, Math.round((256 * vh) / vw));
+    const c = this.segCanvas || (this.segCanvas = document.createElement('canvas'));
+    if (c.width !== sw || c.height !== sh) { c.width = sw; c.height = sh; }
+    c.getContext('2d').drawImage(video, 0, 0, sw, sh);
+    const t0 = performance.now();
+    try {
+      this.seg.segmentForVideo(c, this.nextTs(), (res) => {
+        const masks = res.confidenceMasks;
+        if (!masks || !masks.length) return;
+        const m = masks[masks.length - 1];
+        onMask(m.getAsFloat32Array(), m.width, m.height);
+      });
+    } catch (err) {
+      console.warn('segmentation failed', err);
     }
-    if (this.hands) {
-      const r = this.hands.detectForVideo(video, ts);
-      hands = (r.landmarks || []).map((lm, i) => ({ lm, world: r.worldLandmarks ? r.worldLandmarks[i] : null }));
-    }
-    if (wantSeg && this.seg) {
-      try {
-        this.seg.segmentForVideo(video, ts, (res) => {
-          const masks = res.confidenceMasks;
-          if (!masks || !masks.length) return;
-          const m = masks[masks.length - 1];
-          onMask(m.getAsFloat32Array(), m.width, m.height, masks.length);
-        });
-      } catch (err) {
-        console.warn('segmentation failed', err);
-      }
-    }
-    return { face, hands };
+    this.time('seg', t0);
   }
 }
 
@@ -122,9 +146,31 @@ const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
 /** Smooths face landmarks with an adaptive (speed-aware) filter and derives eye/mouth geometry. */
 export class FaceGeometry {
-  constructor() { this.pts = null; this.raw = null; }
+  constructor() { this.pts = null; this.raw = null; this.irisStab = {}; }
 
-  reset() { this.pts = null; }
+  reset() { this.pts = null; this.irisStab = {}; }
+
+  /**
+   * Extra stabilisation for the irises. Landmark noise of a pixel or two makes an overlay shimmer,
+   * so tiny moves are damped hard while real eye movements still pass straight through. The radius
+   * is noisy too: it is clamped to a plausible share of the eye width and eased slowly.
+   */
+  stabilizeIris(key, e) {
+    const target = Math.min(e.width * 0.25, Math.max(e.width * 0.17, e.irisR));
+    const s = this.irisStab[key];
+    if (!s) {
+      this.irisStab[key] = { x: e.iris.x, y: e.iris.y, r: target };
+    } else {
+      const d = Math.hypot(e.iris.x - s.x, e.iris.y - s.y) / Math.max(1, e.width);
+      const a = Math.min(1, 0.28 + d * 7);
+      s.x += (e.iris.x - s.x) * a;
+      s.y += (e.iris.y - s.y) * a;
+      s.r += (target - s.r) * 0.15;
+    }
+    const st = this.irisStab[key];
+    e.iris = { x: st.x, y: st.y };
+    e.irisR = st.r;
+  }
 
   update(lms, W, H, mirror) {
     const n = lms.length;
@@ -169,6 +215,8 @@ export class FaceGeometry {
       const ri = right.iris, rr = right.irisR;
       right.iris = left.iris; right.irisR = left.irisR; left.iris = ri; left.irisR = rr;
     }
+    this.stabilizeIris('left', left);
+    this.stabilizeIris('right', right);
     const a = left.center.x < right.center.x ? left.center : right.center;
     const b = left.center.x < right.center.x ? right.center : left.center;
     const roll = Math.atan2(b.y - a.y, b.x - a.x);

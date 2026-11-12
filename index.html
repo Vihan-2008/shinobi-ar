@@ -121,7 +121,7 @@
         <tr data-k="camera"><th>Camera</th><td>Waiting</td></tr>
         <tr data-k="face"><th>Face &amp; iris tracking</th><td>Waiting</td></tr>
         <tr data-k="hand"><th>Hand tracking</th><td>Waiting</td></tr>
-        <tr data-k="seg"><th>Body outline (clones, Susanoo)</th><td>Waiting</td></tr>
+        <tr data-k="seg"><th>Body outline (clones, Susanoo)</th><td>On first use</td></tr>
       </table>
       <p class="error hidden" id="startError" role="alert"></p>
       <div class="start-actions">
@@ -237,10 +237,15 @@
         <h3 class="group-title">Sound &amp; effects</h3>
         <div class="rows">
           <label class="row"><span class="row-label">Volume</span><input type="range" id="setVolume" min="0" max="1" step="0.01"><output></output></label>
-          <label class="row"><span class="row-label">Effect detail</span><select id="setQuality"><option value="low">Low (faster)</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+          <label class="row"><span class="row-label">Character songs <small>Plays your song for the eyes you wear</small></span><input type="checkbox" class="switch" id="setMusic"></label>
+          <label class="row"><span class="row-label">Music volume</span><input type="range" id="setMusicVolume" min="0" max="1" step="0.01"><output></output></label>
+          <label class="row"><span class="row-label">Effect detail</span><select id="setQuality"><option value="auto">Auto (adjusts to this device)</option><option value="low">Low (fastest)</option><option value="medium">Medium</option><option value="high">High</option></select></label>
           <label class="row"><span class="row-label">Voice commands</span><input type="checkbox" class="switch" id="setVoice"></label>
           <label class="row"><span class="row-label">Unlimited chakra</span><input type="checkbox" class="switch" id="setChakra"></label>
         </div>
+        <h3 class="group-title">Character songs</h3>
+        <p class="hint">The app has no built-in music. To hear a song when you wear a character's eyes, choose an audio file you own for that character. It stays in this browser and is never uploaded.</p>
+        <div class="rows" id="songList"></div>
       </div>
     </div>
   </div>

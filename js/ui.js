@@ -2,6 +2,7 @@
 
 import { SEALS, SEAL_MAP, JUTSUS, EYES, EYE_ORDER, PRESETS, ABILITIES, FAMILY_LABEL } from './config.js';
 import { drawEyeIcon } from './dojutsu.js';
+import { THEMES, THEME_ORDER } from './music.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -397,7 +398,50 @@ export class UI {
     bindChk('setHandDebug', 'showHandDebug');
     bindChk('setLandmarks', 'showLandmarks');
     bindChk('setChakra', 'unlimitedChakra');
+    bindChk('setMusic', 'music');
+    bindRange('setMusicVolume', 'musicVolume', v => `${Math.round(v * 100)}%`);
     $('#setCamera').addEventListener('change', e => this.app.updateSetting('cameraId', e.target.value));
+    this.buildSongList();
+  }
+
+  /** One row per character theme: the original theme, or the person's own song file for it. */
+  async buildSongList() {
+    const list = $('#songList');
+    let own = {};
+    try { own = await this.app.songs.names(); } catch { /* storage unavailable: originals only */ }
+    list.replaceChildren();
+    for (const key of THEME_ORDER) {
+      const th = THEMES[key];
+      const mine = own[key];
+      const input = h('input', { type: 'file', accept: 'audio/*' });
+      input.addEventListener('change', async () => {
+        const f = input.files[0];
+        input.value = '';
+        if (!f) return;
+        if (!f.type.startsWith('audio/')) { this.toast('That file is not an audio file.', true); return; }
+        if (f.size > 40 * 1024 * 1024) { this.toast('Songs must be under 40 MB.', true); return; }
+        try {
+          await this.app.songs.set(key, f);
+          this.toast(`${th.name} will now play “${f.name}”.`);
+        } catch {
+          this.toast('Could not save that song in this browser.', true);
+        }
+        await this.buildSongList();
+        this.app.updateMusic();
+      });
+      list.append(h('div', { class: 'song-row' },
+        h('span', { class: 'row-label' }, th.name,
+          h('small', { class: mine ? 'own' : '' }, mine ? `Your song · ${mine}` : `No song`)),
+        h('span', { class: 'song-actions' },
+          h('label', { class: 'text-btn file' }, mine ? "Replace" : "Choose song", input),
+          mine && h('button', {
+            class: 'text-btn', onclick: async () => {
+              await this.app.songs.remove(key).catch(() => {});
+              await this.buildSongList();
+              this.app.updateMusic();
+            },
+          }, 'Remove'))));
+    }
   }
 
   setCameras(list, current) {

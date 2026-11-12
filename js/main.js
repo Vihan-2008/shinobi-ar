@@ -12,20 +12,37 @@ import {
 } from './effects.js';
 import { glowSprite, rand, clamp } from './particles.js';
 import { SFX } from './audio.js';
+import { Music, SongStore, themeFor } from './music.js';
 import { Voice } from './voice.js';
 import { UI } from './ui.js';
 
 const $ = s => document.querySelector(s);
 const SETTINGS_KEY = 'shinobi-ar.settings.v1';
-const QUALITY_SCALE = { low: 0.45, medium: 0.75, high: 1 };
-const MODE_DEF = {
-  tsukuyomi: { filter: 'grayscale(1) invert(1) contrast(1.45) brightness(0.92)', tint: '#ff2418', blend: 'multiply' },
-  byakugan: { filter: 'grayscale(1) contrast(1.55) brightness(0.72)', tint: '#8597ff', blend: 'multiply' },
-  infinite: { filter: 'saturate(0.35) brightness(1.18) contrast(0.92)', tint: '#cdb8ff', blend: 'soft-light' },
+
+/**
+ * Performance levels. "Auto" starts high and steps down when the frame budget is blown, so a
+ * slower laptop gets a lighter app instead of a frozen one.
+ *   scale       internal render resolution (the canvas is stretched to the screen)
+ *   fps         render cap
+ *   splitDetect run face and hand models on alternate camera frames
+ *   segEvery    run body segmentation every Nth camera frame
+ */
+const LEVELS = [
+  { name: 'low', scale: 0.6, particles: 0.4, maxParticles: 700, fps: 30, splitDetect: true, segEvery: 3 },
+  { name: 'medium', scale: 0.8, particles: 0.7, maxParticles: 1500, fps: 40, splitDetect: true, segEvery: 2 },
+  { name: 'high', scale: 1, particles: 1, maxParticles: 2600, fps: 60, splitDetect: false, segEvery: 1 },
+];
+const LEVEL_INDEX = { low: 0, medium: 1, high: 2 };
+
+// World tints as blend-mode fills: [operation, colour, strength].
+const MODE_OPS = {
+  tsukuyomi: [['difference', '#ffffff', 1], ['saturation', '#808080', 1], ['multiply', '#ff2a1c', 1]],
+  byakugan: [['saturation', '#808080', 1], ['multiply', '#8a9cff', 1], ['multiply', '#c4c4c4', 1]],
+  infinite: [['saturation', '#808080', 0.65], ['soft-light', '#d6c4ff', 1], ['screen', '#2a2238', 1]],
 };
 const SHARINGAN_FAMS = ['sharingan', 'mangekyo', 'eternal', 'rinne'];
 
-const ENUM_SETTINGS = { fit: ['cover', 'contain'], quality: ['low', 'medium', 'high'], sealMode: ['auto', 'rules', 'trained'] };
+const ENUM_SETTINGS = { fit: ['cover', 'contain'], quality: ['auto', 'low', 'medium', 'high'], sealMode: ['auto', 'rules', 'trained'] };
 
 /** Load saved settings, keeping only known keys whose type matches the default. */
 function loadSettings() {
@@ -43,6 +60,7 @@ function loadSettings() {
   out.volume = clamp(out.volume, 0, 1);
   out.holdMs = clamp(out.holdMs, 80, 600);
   out.knnSensitivity = clamp(out.knnSensitivity, 0.5, 2);
+  out.musicVolume = clamp(out.musicVolume, 0, 1);
   return out;
 }
 
@@ -76,6 +94,9 @@ class App {
     this.sfx = new SFX();
     this.sfx.volume = this.settings.volume;
     this.fx = new FX(this.sfx);
+    this.music = new Music(this.sfx);
+    this.music.volume = this.settings.musicVolume;
+    this.songs = new SongStore();
     this.dojutsu = new DojutsuRenderer();
     this.tracker = new Tracker();
     this.faceGeo = new FaceGeometry();
@@ -112,6 +133,11 @@ class App {
     this.fpsAcc = { n: 0, t: 0 };
     this.lastT = performance.now();
     this.presetIdx = 0;
+    this.levelIdx = 2;
+    this.level = LEVELS[2];
+    this.renderScale = 1;
+    this.pendingScale = false;
+    this.workMs = 0;
 
     this.ui = new UI(this);
     this.voice = new Voice((action) => this.onVoice(action), (st) => this.onVoiceState(st));
@@ -161,6 +187,7 @@ class App {
     $('#startScreen').classList.add('hidden');
     this.running = true;
     this.sfx.activate();
+    this.updateMusic();
     if (!withCamera) this.ui.toast('Camera off. Try the eye presets, Cast buttons and seal keys 1–0.', false, 4);
   }
 
@@ -172,8 +199,9 @@ class App {
     const hand = t.initHands().then(() => this.ui.setLoad('hand', 'ok')).catch(e => { console.error(e); this.ui.setLoad('hand', 'fail'); this.loadError = 'Hand tracking failed to load. Check your connection and reload.'; });
     await Promise.all([face, hand]);
     this.modelsReady = true;
-    this.ui.setLoad('seg', 'busy');
-    t.initSeg().then(() => this.ui.setLoad('seg', 'ok')).catch(e => { console.error(e); this.ui.setLoad('seg', 'fail'); });
+    this.readyAt = performance.now();
+    // The body-outline model only loads when clones, Susanoo or the moon scenes first need it,
+    // so start-up stays light on slower machines.
   }
 
   async startCamera(deviceId) {
@@ -191,8 +219,8 @@ class App {
     this.video.srcObject = stream;
     await this.video.play();
     if (this.video.readyState < 2) await new Promise(r => this.video.addEventListener('loadeddata', r, { once: true }));
-    this.resize(this.video.videoWidth || 1280, this.video.videoHeight || 720);
     this.cameraOn = true;
+    this.resizeForVideo();
     this.lastVideoTime = -1;
     this.faceGeo.reset();
     try {
@@ -206,6 +234,51 @@ class App {
     for (const c of [this.canvas, this.base, this.personCv, this.snap]) { c.width = w; c.height = h; }
     this.fx.world.W = w; this.fx.world.H = h;
     this.history = Array.from({ length: 16 }, () => makeCanvas(Math.round(w / 2), Math.round(h / 2)));
+    this.faceGeo.reset();
+  }
+
+  /** Size the drawing surface to the camera frame times the current render scale. */
+  resizeForVideo() {
+    const vw = this.video.videoWidth || 1280, vh = this.video.videoHeight || 720;
+    const s = this.renderScale;
+    this.resize(Math.round((vw * s) / 2) * 2, Math.round((vh * s) / 2) * 2);
+  }
+
+  setLevel(i) {
+    this.levelIdx = Math.max(0, Math.min(LEVELS.length - 1, i));
+    this.level = LEVELS[this.levelIdx];
+    this.fx.ps.scale = this.level.particles;
+    this.fx.ps.max = this.level.maxParticles;
+    // Changing resolution mid-jutsu would shift effects, so it waits for a quiet moment.
+    if (this.level.scale !== this.renderScale) this.pendingScale = true;
+  }
+
+  applyRenderScale() {
+    this.pendingScale = false;
+    this.renderScale = this.level.scale;
+    if (this.cameraOn) this.resizeForVideo();
+  }
+
+  /** Auto quality: step down after ~2 s over budget, step back up after a long smooth stretch. */
+  autoTune(fps) {
+    if (this.settings.quality !== 'auto' || !this.cameraOn || !this.modelsReady || document.hidden) return;
+    if (performance.now() - (this.readyAt || 0) < 3000) return;
+    // Judge by the frame rate actually achieved; per-frame work is only a tie-breaker, because a
+    // camera frame with tracking costs far more than the frames in between.
+    const budget = 1000 / this.level.fps;
+    const slow = fps < this.level.fps * 0.62 || this.workMs > budget * 1.6;
+    const next = LEVELS[this.levelIdx + 1];
+    const roomy = !slow && next && this.workMs < (1000 / next.fps) * 0.4 && fps >= this.level.fps * 0.9;
+    this.slowFor = slow ? (this.slowFor || 0) + 0.5 : 0;
+    this.roomyFor = roomy ? (this.roomyFor || 0) + 0.5 : 0;
+    if (this.slowFor >= 3 && this.levelIdx > 0) {
+      this.setLevel(this.levelIdx - 1);
+      this.slowFor = 0;
+      if (!this.tunedNotice) { this.tunedNotice = true; this.ui.toast('Lowered effect detail to keep things smooth on this device.', false, 4); }
+    } else if (this.roomyFor >= 15) {
+      this.setLevel(this.levelIdx + 1);
+      this.roomyFor = 0;
+    }
   }
 
   /* ───────── Settings ───────── */
@@ -219,12 +292,15 @@ class App {
   applySettings(initial, key) {
     const s = this.settings;
     document.getElementById('app').classList.toggle('fit-contain', s.fit === 'contain');
-    this.fx.ps.scale = QUALITY_SCALE[s.quality] || 1;
+    if (s.quality !== 'auto') this.setLevel(LEVEL_INDEX[s.quality]);
+    else if (initial || key === 'quality') this.setLevel(2);
     this.stab.holdMs = s.holdMs;
     this.seq.lenient = s.lenient;
     this.trainer.sensitivity = s.knnSensitivity;
     this.maskState.mirror = s.mirror;
     this.sfx.setVolume(s.volume);
+    this.music.setVolume(s.musicVolume);
+    if (key === 'music') this.updateMusic();
     if (key === 'mirror') { this.faceGeo.reset(); this.maskState.locked = false; this.maskState.votes = 0; }
     if (key === 'voice' || (initial && s.voice)) {
       if (initial) { s.voice = false; this.ui.setVoiceToggle(false); }
@@ -272,6 +348,26 @@ class App {
     if (changed) { if (anyOn) this.sfx.activate(); else this.sfx.deactivate(); }
     this.enforceAbilityRequirements();
     this.ui.refreshEyes();
+    if (changed) this.updateMusic();
+  }
+
+  /** The preset whose eyes exactly match the current ones, if any. */
+  currentPreset() {
+    const d = this.dojutsu;
+    return PRESETS.find(p => p.left === d.get('left') && p.right === d.get('right') && p.third === d.get('third')) || null;
+  }
+
+  /** Play the theme for the current eyes: your own song for that character if you set one, else the original theme. */
+  async updateMusic() {
+    if (!this.running || !this.sfx.ctx) return;
+    if (!this.settings.music) { this.music.stop(); return; }
+    const preset = this.currentPreset();
+    const key = themeFor(preset && preset.id, this.dojutsu.families());
+    const own = key ? await this.songs.get(key) : null;
+    // Ignore a stale answer if the eyes changed while the song was being looked up.
+    const again = this.currentPreset();
+    if (themeFor(again && again.id, this.dojutsu.families()) !== key) return;
+    this.music.play(key, own && own.blob);
   }
 
   selectEye(type, target) {
@@ -297,13 +393,16 @@ class App {
 
   hasFamily(fams) { return this.dojutsu.families().some(f => fams.includes(f)); }
 
-  auraColor() {
+  /** Colour and guardian style for Susanoo, taken from the first eye that carries one. */
+  auraStyle() {
     for (const slot of ['right', 'left', 'third']) {
       const d = EYES[this.dojutsu.get(slot)];
-      if (d.aura && ['mangekyo', 'eternal', 'rinnegan'].includes(d.family)) return d.aura;
+      if (d.aura && d.guardian) return { color: d.aura, variant: d.guardian };
     }
-    return '#a35cff';
+    return { color: '#a35cff', variant: 'storm' };
   }
+
+  auraColor() { return this.auraStyle().color; }
 
   sharinganEyeType() {
     for (const slot of ['right', 'left']) {
@@ -317,7 +416,7 @@ class App {
     const sus = this.fx.find(Susanoo);
     if (sus && sus.on) {
       if (!this.hasFamily(ABILITY_MAP.susanoo.requires)) sus.toggleOff();
-      else sus.setColor(this.auraColor());
+      else { const st = this.auraStyle(); sus.setStyle(st.color, st.variant); }
     }
     const bv = this.fx.find(ByakuganSight);
     if (bv && bv.on && !this.hasFamily(ABILITY_MAP.byakuganVision.requires)) bv.toggleOff();
@@ -374,33 +473,59 @@ class App {
       if (c && !c.ending) { c.dispel(); this.ui.toast('Clones dispelled'); return; }
     }
     if (id === 'rasengan') {
-      const r = fx.find(Rasengan);
-      if (r && !r.ending) { if (!r.shuriken) r.evolve(); else r.release(); return; }
+      const all = fx.effects.filter(e => e instanceof Rasengan && !e.done && !e.ending);
+      const main = all.find(e => !e.silent);
+      if (main) { const evolve = !main.shuriken; all.forEach(r => (evolve ? r.evolve() : r.release())); return; }
     }
     if (!this.spend(j.cost)) return;
     this.sfx.cast();
-    fx.callout({ kanji: j.kanji, title: j.name, sub: j.romaji, color: j.color });
-    this.ui.flashJutsu(id);
+    const hand = id === 'rasengan' ? (opts.hand || this.hands.find(h => h.shape === 'O') || this.hands[0] || null) : null;
+    if (id === 'chidori') fx.effects.filter(e => e instanceof Chidori).forEach(e => e.finish());
     switch (id) {
       case 'fireball': fx.add(new Fireball(fx)); break;
       case 'phoenix': fx.add(new PhoenixFlower(fx)); break;
-      case 'chidori': { const old = fx.find(Chidori); if (old) old.finish(); fx.add(new Chidori(fx)); break; }
-      case 'rasengan': {
-        const hand = opts.hand || this.hands.find(h => h.shape === 'O') || this.hands[0] || null;
-        fx.add(new Rasengan(fx, hand));
-        break;
-      }
+      case 'chidori': fx.add(new Chidori(fx)); break;
+      case 'rasengan': fx.add(new Rasengan(fx, hand)); break;
       case 'clone':
-        if (this.cameraOn && !this.tracker.seg) this.ui.toast('Body segmentation is still loading: clones will appear once it is ready.', false, 3.5);
+        if (this.cameraOn && !this.tracker.seg) this.ui.toast('Loading body outline: your clones appear in a moment.', false, 3.5);
         fx.add(new ShadowClones(fx));
         break;
       case 'summon': fx.add(new Summoning(fx)); break;
       case 'earthwall': fx.add(new EarthWall(fx)); break;
       case 'waterdragon': fx.add(new WaterDragon(fx)); break;
     }
+    const copies = this.cloneCast(id, hand);
+    fx.callout({
+      kanji: copies ? `多重${j.kanji.split('・').pop()}` : j.kanji,
+      title: copies ? `Multi ${j.name}` : j.name,
+      sub: copies ? `You and ${copies} shadow clones` : j.romaji,
+      color: j.color,
+    });
+    this.ui.flashJutsu(id);
     this.seq.reset();
     this.ui.setSequence(this.seq.buffer);
     this.ui.refreshJutsuProgress(this.seq);
+  }
+
+  /**
+   * With shadow clones out, each visible clone casts its own copy of a body-anchored jutsu from its
+   * position: same mouth or hand, scaled to the clone. Copies are silent and lighter on particles.
+   */
+  cloneCast(id, hand) {
+    const sc = this.fx.find(ShadowClones);
+    if (!sc || !sc.active || !['fireball', 'phoenix', 'chidori', 'rasengan'].includes(id)) return 0;
+    let n = 0;
+    sc.clones.forEach((c, i) => {
+      if (!c.shown) return;
+      const opts = { xf: () => sc.xfFor(i), silent: true, rateK: 0.4 };
+      const e = id === 'fireball' ? new Fireball(this.fx, opts)
+        : id === 'phoenix' ? new PhoenixFlower(this.fx, opts)
+          : id === 'chidori' ? new Chidori(this.fx, opts)
+            : new Rasengan(this.fx, hand, opts);
+      this.fx.add(e);
+      n++;
+    });
+    return n;
   }
 
   useAbility(id, opts = {}) {
@@ -419,7 +544,7 @@ class App {
         const s = fx.find(Susanoo);
         if (s && s.on) { s.toggleOff(); break; }
         if (s) s.finish();
-        fx.add(new Susanoo(fx, this.auraColor()));
+        { const st = this.auraStyle(); fx.add(new Susanoo(fx, st.color, st.variant)); }
         if (this.cameraOn && !this.tracker.seg) this.ui.toast('Body segmentation is still loading: the aura will wrap your body once ready.', false, 3.5);
         fx.callout({ kanji: a.kanji, title: a.name, color: this.auraColor() });
         break;
@@ -740,14 +865,54 @@ class App {
 
   frame(t) {
     requestAnimationFrame(tt => this.frame(tt));
-    const dt = Math.min(0.05, (t - this.lastT) / 1000);
+    if (!this.running) { this.lastT = t; return; }
+    // Frame pacing: high-refresh screens would otherwise render 120–144 times a second for no gain.
+    const interval = 1000 / this.level.fps;
+    this.pace = Math.min(interval * 2, (this.pace || 0) + (t - this.lastT));
     this.lastT = t;
-    if (!this.running) return;
+    if (this.pace < interval - 1) return;
+    this.pace -= interval;
+    const dt = Math.min(0.05, (t - (this.lastStep || t - interval)) / 1000);
+    this.lastStep = t;
+    const t0 = performance.now();
     try {
       this.step(t, dt);
     } catch (err) {
       console.error(err);
     }
+    const work = performance.now() - t0;
+    this.workMs = this.workMs ? this.workMs * 0.9 + work * 0.1 : work;
+  }
+
+  /**
+   * Run the trackers for a new camera frame. When the face and hand models together are slow
+   * (CPU fallback or a weak GPU), they take turns on alternate frames so the page never stalls.
+   */
+  track(now, dt) {
+    const { W, H, fx } = this;
+    const mirror = this.settings.mirror;
+    const tr = this.tracker;
+    this.vFrame = (this.vFrame || 0) + 1;
+    const split = this.level.splitDetect || tr.ms.face + tr.ms.hands > 22;
+    const doFace = !split || this.vFrame % 2 === 0;
+    const doHands = !split || this.vFrame % 2 === 1;
+    if (doFace) {
+      const f = tr.detectFace(this.video);
+      if (f !== undefined) this.face = f ? this.faceGeo.update(f, W, H, mirror) : (this.faceGeo.reset(), null);
+    }
+    if (doHands) {
+      const hs = tr.detectHands(this.video);
+      if (hs !== undefined) this.hands = hs.map(h => analyzeHand(h, W, H, mirror));
+    }
+    const wantSeg = fx.needsSeg();
+    if (wantSeg && !tr.segLoading) tr.initSeg().catch(e => { console.error(e); this.ui.toast('Body outline failed to load: clones and auras need it.', true, 4); });
+    if (wantSeg && tr.seg) {
+      if (this.vFrame % this.level.segEvery === 0) tr.segment(this.video, (d, w, h) => this.onMask(d, w, h));
+    } else this.maskState.ready = false;
+    fx.world.face = this.face;
+    fx.world.hands = this.hands;
+    if (doHands) this.processSeals(now);
+    this.processGestures(now, dt);
   }
 
   step(now, dt) {
@@ -757,16 +922,7 @@ class App {
     // 1. Tracking
     if (this.cameraOn && this.modelsReady && this.video.readyState >= 2 && this.video.currentTime !== this.lastVideoTime) {
       this.lastVideoTime = this.video.currentTime;
-      const wantSeg = fx.needsSeg() && !!this.tracker.seg;
-      if (fx.needsSeg() && !this.tracker.segLoading) this.tracker.initSeg();
-      const r = this.tracker.detect(this.video, wantSeg, (d, w, h) => this.onMask(d, w, h));
-      if (!wantSeg) this.maskState.ready = false;
-      this.face = r.face ? this.faceGeo.update(r.face, W, H, mirror) : (this.faceGeo.reset(), null);
-      this.hands = (r.hands || []).map(h => analyzeHand(h, W, H, mirror));
-      fx.world.face = this.face;
-      fx.world.hands = this.hands;
-      this.processSeals(now);
-      this.processGestures(now, dt);
+      this.track(now, dt);
     } else if (!this.cameraOn) {
       this.ui.setSealLive(null, 0, 'Camera off: press 1–0, −, = to enter seals');
     }
@@ -774,8 +930,10 @@ class App {
     // 2. Simulation
     fx.update(dt);
     this.chakra = Math.min(100, this.chakra + dt * 9);
+    if (this.pendingScale && !fx.effects.length) this.applyRenderScale();
 
-    // 3. Base frame (video + world filters)
+    // 3. Base frame: video, world tints, then the eyes, all on one layer so shadow clones
+    //    (which are cut out of this layer) wear the same dōjutsu as you.
     const b = this.bctx;
     b.save();
     if (this.cameraOn) {
@@ -786,22 +944,17 @@ class App {
     const modes = fx.modes();
     for (const [name, k] of Object.entries(modes)) {
       if (k <= 0.001) continue;
-      const def = MODE_DEF[name];
-      b.save();
-      b.globalAlpha = k;
-      b.filter = def.filter;
-      if (this.cameraOn) {
-        if (mirror) { b.translate(W, 0); b.scale(-1, 1); }
-        b.drawImage(this.video, 0, 0, W, H);
-      } else b.drawImage(this.base, 0, 0);
-      b.restore();
-      b.save();
-      b.globalAlpha = k;
-      b.globalCompositeOperation = def.blend;
-      b.fillStyle = def.tint;
-      b.fillRect(0, 0, W, H);
-      b.restore();
+      // Blend-mode fills instead of canvas filters: filters can drop to the CPU and freeze slower laptops.
+      for (const [op, color, a] of MODE_OPS[name]) {
+        b.globalCompositeOperation = op;
+        b.globalAlpha = k * a;
+        b.fillStyle = color;
+        b.fillRect(0, 0, W, H);
+      }
+      b.globalCompositeOperation = 'source-over';
+      b.globalAlpha = 1;
     }
+    if (this.cameraOn) this.dojutsu.render(b, this.face, now, dt);
 
     // 4. Compose
     const ctx = this.ctx;
@@ -840,10 +993,9 @@ class App {
       if (personReady) ctx.drawImage(this.personCv, 0, 0);
     }
 
-    this.dojutsu.render(ctx, this.face, now, dt);
     if (this.hasFamily(SHARINGAN_FAMS)) this.drawTrails(ctx, now);
 
-    if (fx.effects.length) this.sctx.drawImage(this.canvas, 0, 0);
+    if (fx.needsSnapshot()) this.sctx.drawImage(this.canvas, 0, 0);
     fx.draw(ctx);
     fx.drawParticles(ctx);
     if (this.settings.showLandmarks) this.drawLandmarks(ctx);
@@ -986,6 +1138,8 @@ class App {
     if (a.t >= 0.5) {
       const fps = Math.round(a.n / a.t);
       a.n = 0; a.t = 0;
+      this.fps = fps;
+      this.autoTune(fps);
       this.updateStatus(fps);
       this.ui.refreshAbilities();
       if (this.recording) {
@@ -993,8 +1147,8 @@ class App {
         this.ui.setRecording(true, `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`);
       }
     }
-    this.ui.setChakra(this.chakra);
-    const hands = this.cameraOn && this.modelsReady && this.hands.length
+    if (Math.abs(this.chakra - (this.shownChakra ?? -1)) > 0.5) { this.shownChakra = this.chakra; this.ui.setChakra(this.chakra); }
+    const hands =this.cameraOn && this.modelsReady && this.hands.length
       ? [...this.hands].sort((p, q) => p.palm.x - q.palm.x).map(describeHand).join('   ') : '';
     this.ui.setHandsDebug(hands ? `Reading: ${hands}` : '', this.settings.showHandDebug);
     this.ui.setSequence(this.seq.buffer);
@@ -1006,6 +1160,7 @@ class App {
     if (!this.cameraOn) return this.ui.setStatus('Preview · camera off' + voice, '');
     if (this.loadError) return this.ui.setStatus(this.loadError, 'error');
     if (!this.modelsReady) return this.ui.setStatus('Loading face and hand tracking…', 'busy');
+    if (this.fx.needsSeg() && !this.tracker.seg) return this.ui.setStatus('Loading body outline…', 'busy');
     const n = this.hands.length;
     const handTxt = n === 0 ? 'no hands' : n === 1 ? '1 hand' : '2 hands';
     if (!this.face) return this.ui.setStatus(`Looking for your face · ${handTxt} · ${fps} fps${voice}`, 'warn');
